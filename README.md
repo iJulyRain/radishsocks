@@ -1,2 +1,3 @@
 # radishsocks
-reverse socks
+
+a secure tunnel, just like shadowsocks.
