@@ -1,18 +1,19 @@
 /*
  * =====================================================================================
  *
- *       Filename:  relay.h
+ *       Filename:  camouflage.c
  *
- *    Description:  relay header file
+ *    Description:  camouflage
  *
  *        Version:  1.0
- *        Created:  10/25/2016 12:00:21 AM
+ *        Created:  10/27/2016 02:07:52 AM
  *       Revision:  none
  *       Compiler:  gcc
  *
- *         Author:  julyrain (T3), lzx1442@163.com
+ *         Author:  lizhixian (group3), lizhixian@integritytech.com.cn
  *   Organization:  
  *
  * =====================================================================================
  */
+
 

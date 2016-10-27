@@ -1,19 +1,18 @@
 /*
  * =====================================================================================
  *
- *       Filename:  event_epoll.cpp
+ *       Filename:  crypto.h
  *
- *    Description:  event using epoll
+ *    Description:  crypto header
  *
  *        Version:  1.0
- *        Created:  10/24/2016 11:39:15 PM
+ *        Created:  10/27/2016 02:04:02 AM
  *       Revision:  none
  *       Compiler:  gcc
  *
- *         Author:  julyrain (T3), lzx1442@163.com
+ *         Author:  lizhixian (group3), lizhixian@integritytech.com.cn
  *   Organization:  
  *
  * =====================================================================================
  */
-
 

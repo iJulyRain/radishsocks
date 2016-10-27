@@ -1,18 +1,24 @@
 /*
  * =====================================================================================
  *
- *       Filename:  buffer.h
+ *       Filename:  server.c
  *
- *    Description:  buffer header file
+ *    Description:  server for radishsocks
  *
  *        Version:  1.0
- *        Created:  10/24/2016 11:53:28 PM
+ *        Created:  10/27/2016 01:07:56 AM
  *       Revision:  none
  *       Compiler:  gcc
  *
- *         Author:  julyrain (T3), lzx1442@163.com
+ *         Author:  lizhixian (group3), lizhixian@integritytech.com.cn
  *   Organization:  
  *
  * =====================================================================================
  */
 
+#include <stdio.h>
+
+int main(int argc, char **argv)
+{
+    return 0;
+}
