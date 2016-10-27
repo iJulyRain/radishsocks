@@ -30,6 +30,6 @@ enum{
 
 int loglevel;
 
-void log(int level, const char *format, ...);
+void vlog(int level, const char *format, ...);
 
 #endif

@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <signal.h>
+#include <errno.h>
 
 #include <getopt.h>
 #include <libgen.h>
@@ -44,35 +45,25 @@ struct ev_container
 {
     struct event_base *evbase;
     char srv_ip[16];
-    int  srv_port;
     char srv_pwd[64];
+    int  srv_port;
 };
-
-static void
-listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
-    struct sockaddr *sa, int socklen, void *user_data)
-{
-    struct ev_container *evc = (struct ev_container *)user_data;
-
-	bev = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE);
-	if (!bev) {
-		log(ERROR, "Error constructing bufferevent!");
-		event_base_loopbreak(base);
-		return;
-	}
-	bufferevent_setcb(bev, conn_readcb, conn_writecb, conn_eventcb, NULL);
-	bufferevent_enable(bev, EV_WRITE);
-	bufferevent_enable(bev, EV_READ);
-}
 
 static void
 conn_readcb(struct bufferevent *bev, void *user_data)
 {
-	struct evbuffer *output = bufferevent_get_output(bev);
-	if (evbuffer_get_length(output) == 0) {
-		printf("flushed answer\n");
-		bufferevent_free(bev);
-	}
+	ev_ssize_t datalen = 0;
+	struct evbuffer *input = bufferevent_get_input(bev);
+	char *data = NULL;
+
+	datalen = evbuffer_get_length(input); 
+	data = (char *)calloc(1, datalen + 1);
+
+	datalen = evbuffer_remove(input, data, datalen);
+
+	vlog(INFO, "(%d)%s\n", datalen, data);
+
+	free(data);
 }
 
 static void
@@ -81,7 +72,6 @@ conn_writecb(struct bufferevent *bev, void *user_data)
 	struct evbuffer *output = bufferevent_get_output(bev);
 	if (evbuffer_get_length(output) == 0) {
 		printf("flushed answer\n");
-		bufferevent_free(bev);
 	}
 }
 
@@ -99,31 +89,55 @@ conn_eventcb(struct bufferevent *bev, short events, void *user_data)
 	bufferevent_free(bev);
 }
 
+static void
+listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
+    struct sockaddr *sa, int socklen, void *user_data)
+{
+    struct ev_container *evc = (struct ev_container *)user_data;
+	struct bufferevent *bev = NULL;
+
+	vlog(DEBUG, "new client from %s:%d\n", 
+		inet_ntoa(((struct sockaddr_in *)sa)->sin_addr), ntohs(((struct sockaddr_in *)sa)->sin_port));
+
+	bev = bufferevent_socket_new(evc->evbase, fd, BEV_OPT_CLOSE_ON_FREE);
+	if (!bev) {
+		vlog(ERROR, "Error constructing bufferevent!");
+		event_base_loopbreak(evc->evbase);
+		return;
+	}
+
+	bufferevent_setcb(bev, conn_readcb, conn_writecb, conn_eventcb, NULL);
+	bufferevent_disable(bev, EV_WRITE);
+	bufferevent_enable(bev, EV_READ);
+}
 
 static int 
 init(struct event_base **evbase, int argc, char **argv)
 {
     struct event_base *base;
 	struct evconnlistener *listener;
-	struct event *signal_event;
 
 	struct sockaddr_in saddr;
-    struct ev_container evc;
+    struct ev_container *evc;
 
     if (argc < 6)
     {
-        log(ERROR, "usage: ./%s server_ip server_port local_ip local_port password", basename(argv[0]));
+        vlog(ERROR, "usage: ./%s server_ip server_port local_ip local_port password\n", basename(argv[0]));
         return -1;
     }
+
+	loglevel = INFO;
 
     base = event_base_new();
     assert(base);
     *evbase = base;
 
-    evc.evbase = base; 
-    strncpy(evc.srv_ip, argv[1], 15);
-    strncpy(evc.srv_pwd, argv[5], 63);
-    evc.srv_port = atoi(argv[2]);
+	evc = (struct ev_container *)calloc(1, sizeof(struct ev_container));
+
+    evc->evbase = base; 
+    strncpy(evc->srv_ip, argv[1], 15);
+    strncpy(evc->srv_pwd, argv[5], 63);
+    evc->srv_port = atoi(argv[2]);
 
     memset(&saddr, 0, sizeof(struct sockaddr_in));
     saddr.sin_family = AF_INET;
@@ -152,7 +166,7 @@ main(int argc, char **argv)
     rc = init(&base, argc, argv);
     if (rc != 0)
     {
-        log(ERROR, "initial fatal!\n");
+        vlog(ERROR, "initial fatal!\n");
         return -1;
     }
 

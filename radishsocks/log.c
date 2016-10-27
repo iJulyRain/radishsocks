@@ -18,7 +18,7 @@
 
 #include "log.h"
 
-void log(int level, const char *format, ...)
+void vlog(int level, const char *format, ...)
 {
     va_list ap; 
 
