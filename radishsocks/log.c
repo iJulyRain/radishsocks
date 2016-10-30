@@ -21,9 +21,12 @@
 void vlog(int level, const char *format, ...)
 {
     va_list ap; 
+	const char *header[] = {"ERROR", "DEBUG", "INFO"};
 
     if (level > loglevel)
         return ;
+
+	printf("[%s] ", header[level]);
 
     va_start(ap, format);
     vprintf(format, ap);

@@ -46,6 +46,16 @@ static char server_ip[16];
 static char server_pwd[64];
 static int  server_port;
 
+#define STAGE_VERSION 0x01
+#define STATE_ADDR    0x02
+#define STATE_STREAM  0x03
+
+struct ev_container{
+	struct bufferevent *bev;
+
+	int stage;
+};
+
 static void
 conn_writecb(struct bufferevent *bev, void *user_data)
 {
@@ -102,54 +112,29 @@ cli_readcb(struct bufferevent *bev, void *user_data)
 static void
 conn_readcb(struct bufferevent *bev, void *user_data)
 {
-    int rc;
 	struct evbuffer *input = bufferevent_get_input(bev);
     struct bufferevent *partner = user_data;
-	char *data = NULL;
 	ev_ssize_t datalen = 0;
-    struct sockaddr_in saddr;
    
-    memset(&saddr, 0, sizeof(struct sockaddr_in));
-    saddr.sin_family = AF_INET;
-    saddr.sin_port = htons(server_port);
-    saddr.sin_addr.s_addr = inet_addr(server_ip);
-
-    if (bufferevent_getfd(partner) == -1){
-        rc = bufferevent_socket_connect(
-            partner,
-            (struct sockaddr *)&saddr,
-            sizeof(saddr)
-        );
-        if (rc < 0) {
-            vlog(ERROR, "bufferevent socket connect\n");
-
-            bufferevent_free(bev);
-            bufferevent_free(partner);
-
-            return;
-        }
-    }
-
-    //TODO using memory pool
 	datalen = evbuffer_get_length(input); 
-	data = (char *)calloc(1, datalen + 1);
+
+	char data[datalen + 1];
+	
 	datalen = evbuffer_remove(input, data, datalen);
 	//vlog(INFO, "(%d)%s\n", datalen, data);
 
-    bufferevent_setcb(partner, cli_readcb, conn_writecb, conn_eventcb, bev);
     bufferevent_write(partner, data, datalen);
     bufferevent_enable(partner, EV_WRITE);
-	bufferevent_enable(partner, EV_READ);
-
-    free(data);
 }
 
 static void
 listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
     struct sockaddr *sa, int socklen, void *user_data)
 {
+    int rc;
 	struct bufferevent *bev_in  = NULL;
 	struct bufferevent *bev_out = NULL;
+    struct sockaddr_in saddr;
 
 	vlog(DEBUG, "new client from %s:%d\n", 
 		inet_ntoa(((struct sockaddr_in *)sa)->sin_addr), ntohs(((struct sockaddr_in *)sa)->sin_port));
@@ -170,7 +155,29 @@ listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
 
 	bufferevent_setcb(bev_in, conn_readcb, conn_writecb, conn_eventcb, bev_out);
 	bufferevent_enable(bev_in, EV_READ);
-	//bufferevent_disable(bev, EV_WRITE);
+
+	//<connect to server
+    memset(&saddr, 0, sizeof(struct sockaddr_in));
+    saddr.sin_family = AF_INET;
+    saddr.sin_port = htons(server_port);
+    saddr.sin_addr.s_addr = inet_addr(server_ip);
+
+	rc = bufferevent_socket_connect(
+		bev_out,
+		(struct sockaddr *)&saddr,
+		sizeof(saddr)
+	);
+	if (rc < 0) {
+		vlog(ERROR, "bufferevent socket connect\n");
+
+		bufferevent_free(bev_in);
+		bufferevent_free(bev_out);
+
+		return;
+	}
+
+    bufferevent_setcb(bev_out, cli_readcb, conn_writecb, conn_eventcb, bev_in);
+	bufferevent_enable(bev_out, EV_READ);
 }
 
 static int 
@@ -179,12 +186,12 @@ init(int argc, char **argv)
 	struct evconnlistener *listener;
 	struct sockaddr_in saddr;
 
+    //TODO options
     if (argc < 6){
         vlog(ERROR, "usage: ./%s server_ip server_port local_ip local_port password\n", basename(argv[0]));
         return -1;
     }
 
-    //TODO
 	loglevel = INFO;
 
     base = event_base_new();
