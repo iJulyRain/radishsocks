@@ -31,5 +31,6 @@ enum{
 int loglevel;
 
 void vlog(int level, const char *format, ...);
+void vlog_array(int level, char arr[], int arr_size);
 
 #endif

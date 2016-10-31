@@ -17,18 +17,35 @@
  */
 
 #include "log.h"
+	
+static const char *header[] = {"ERROR", "DEBUG", "INFO"};
 
 void vlog(int level, const char *format, ...)
 {
     va_list ap; 
-	const char *header[] = {"ERROR", "DEBUG", "INFO"};
 
     if (level > loglevel)
         return ;
 
-	printf("[%s] ", header[level]);
+	printf("[%s][%d][%s] ", __FILE__, __LINE__, header[level]);
 
     va_start(ap, format);
     vprintf(format, ap);
     va_end(ap);
 }
+
+void vlog_array(int level, char arr[], int arr_size)
+{
+	int i;
+
+    if (level > loglevel)
+        return ;
+
+	printf("[%s][%d][%s] ", __FILE__, __LINE__, header[level]);
+
+	for (i = 0; i < arr_size; i++)
+		printf("%#02X ", arr[i]);
+	
+	printf("\n");
+}
+

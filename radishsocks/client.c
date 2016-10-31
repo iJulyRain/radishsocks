@@ -46,12 +46,16 @@ static char server_ip[16];
 static char server_pwd[64];
 static int  server_port;
 
+#define STAGE_INIT    0x00
 #define STAGE_VERSION 0x01
-#define STATE_ADDR    0x02
-#define STATE_STREAM  0x03
+#define STAGE_ADDR    0x02
+#define STAGE_STREAM  0x03
+
+#define BEV_TIMEOUT   10 //s
 
 struct ev_container{
-	struct bufferevent *bev;
+	struct bufferevent *bev_local, *bev_remote;
+	int bev_local_timeout, bev_remote_timeout;
 
 	int stage;
 };
@@ -70,7 +74,7 @@ conn_writecb(struct bufferevent *bev, void *user_data)
 static void
 conn_eventcb(struct bufferevent *bev, short events, void *user_data)
 {
-    struct bufferevent *partner = user_data;
+	struct ev_container *evc = user_data;
 
 	if (events & BEV_EVENT_EOF) {
 		vlog(ERROR, "Connection closed.\n");
@@ -83,48 +87,138 @@ conn_eventcb(struct bufferevent *bev, short events, void *user_data)
 
 	/* None of the other events can happen here, since we haven't enabled
 	 * timeouts */
-	bufferevent_free(bev);
-    bufferevent_free(partner);
+	bufferevent_free(evc->bev_local);
+    bufferevent_free(evc->bev_remote);
 }
 
 //client read callback
 static void
-cli_readcb(struct bufferevent *bev, void *user_data)
+remote_readcb(struct bufferevent *bev, void *user_data)
 {
 	struct evbuffer *input = bufferevent_get_input(bev);
-    struct bufferevent *partner = user_data;
-	char *data = NULL;
+	struct ev_container *evc = user_data;
+    struct bufferevent *partner = evc->bev_local;
 	ev_ssize_t datalen = 0;
 
-    //TODO using memory pool
 	datalen = evbuffer_get_length(input); 
-	data = (char *)calloc(1, datalen + 1);
-	datalen = evbuffer_remove(input, data, datalen);
-	//vlog(INFO, "(%d)%s\n", datalen, data);
-    
-    bufferevent_write(partner, data, datalen);
-    bufferevent_enable(partner, EV_WRITE);
 
-	free(data);
+	char data[datalen + 1];
+	datalen = evbuffer_remove(input, data, datalen);
+
+	vlog_array(INFO, data, datalen);
+
+	switch (evc->stage)
+	{
+		case STAGE_ADDR:
+		{
+			//TODO decrypt
+			bufferevent_write(partner, data, datalen);
+			bufferevent_enable(partner, EV_WRITE);
+
+			evc->stage = STAGE_STREAM;
+		}
+			break;
+		case STAGE_STREAM:
+		{
+			//TODO decrypt
+			bufferevent_write(partner, data, datalen);
+			bufferevent_enable(partner, EV_WRITE);
+		}
+			break;
+	}
 }
 
 //local server read callback
 static void
-conn_readcb(struct bufferevent *bev, void *user_data)
+local_readcb(struct bufferevent *bev, void *user_data)
 {
 	struct evbuffer *input = bufferevent_get_input(bev);
-    struct bufferevent *partner = user_data;
+	struct ev_container *evc = user_data;
+    struct bufferevent *partner = evc->bev_remote;
 	ev_ssize_t datalen = 0;
    
 	datalen = evbuffer_get_length(input); 
 
 	char data[datalen + 1];
-	
 	datalen = evbuffer_remove(input, data, datalen);
 	//vlog(INFO, "(%d)%s\n", datalen, data);
 
-    bufferevent_write(partner, data, datalen);
-    bufferevent_enable(partner, EV_WRITE);
+	vlog_array(INFO, data, datalen);
+
+	switch (evc->stage)
+	{
+		case STAGE_INIT:
+		{
+			int i, method, nmethods = 0;
+			int noauth = 0, pwdauth = 0;
+			char output[4];
+
+			if (datalen < 3){
+				vlog(ERROR, "Socks5 method header too short\n");
+				bufferevent_free(bev);
+				bufferevent_free(partner);
+			}
+
+			if (data[0] != 0x05){
+				vlog(ERROR, "Only Supported Socks5\n");
+				bufferevent_free(bev);
+				bufferevent_free(partner);
+			}
+
+			nmethods = data[1];
+
+			if (nmethods < 1 || datalen != (nmethods + 2)){
+				vlog(ERROR, "Socks5 NMETHODs and METHODS not match\n");
+				bufferevent_free(bev);
+				bufferevent_free(partner);
+			}
+			
+			for (i = 0; i < nmethods; i++){
+				method = data[2 + i];	
+				if (method == 0x00)
+					noauth = 1;
+				else if (method == 0x02)
+					pwdauth = 1;
+			}
+
+			output[0] = 0x05;
+			if (noauth)
+				output[1] = 0x00;
+			else if (pwdauth)
+				output[1] = 0x02;
+
+			bufferevent_write(bev, output, 2);
+			bufferevent_enable(bev, EV_WRITE);
+
+			evc->stage = STAGE_VERSION;
+		}
+			break;
+		case STAGE_VERSION:
+		{
+			//TODO encrypt
+			bufferevent_write(partner, data, datalen);
+			bufferevent_enable(partner, EV_WRITE);
+
+			evc->stage = STAGE_ADDR;
+		}
+			break;
+		case STAGE_STREAM:
+		{
+			//TODO encrypt
+			bufferevent_write(partner, data, datalen);
+			bufferevent_enable(partner, EV_WRITE);
+		}
+			break;
+	}
+}
+
+static void
+timeout_cb(evutil_socket_t fd, short event, void *user_data)
+{
+	struct ev_container *evc = user_data;
+
+	bufferevent_free(evc->bev_local);
+    bufferevent_free(evc->bev_remote);
 }
 
 static void
@@ -132,9 +226,12 @@ listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
     struct sockaddr *sa, int socklen, void *user_data)
 {
     int rc;
+	struct event *timeout;
+	struct timeval tv;
 	struct bufferevent *bev_in  = NULL;
 	struct bufferevent *bev_out = NULL;
     struct sockaddr_in saddr;
+	struct ev_container *evc;
 
 	vlog(DEBUG, "new client from %s:%d\n", 
 		inet_ntoa(((struct sockaddr_in *)sa)->sin_addr), ntohs(((struct sockaddr_in *)sa)->sin_port));
@@ -153,9 +250,18 @@ listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
 		return;
 	}
 
-	bufferevent_setcb(bev_in, conn_readcb, conn_writecb, conn_eventcb, bev_out);
+	///<local
+	evc = (struct ev_container *)calloc(1, sizeof(struct ev_container));
+	assert(evc);
+
+	evc->bev_local = bev_in;
+	evc->bev_remote = bev_out;
+	evc->stage = STAGE_INIT;
+
+	bufferevent_setcb(bev_in, local_readcb, conn_writecb, conn_eventcb, (void *)evc);
 	bufferevent_enable(bev_in, EV_READ);
 
+	//==========================================================
 	//<connect to server
     memset(&saddr, 0, sizeof(struct sockaddr_in));
     saddr.sin_family = AF_INET;
@@ -176,8 +282,14 @@ listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
 		return;
 	}
 
-    bufferevent_setcb(bev_out, cli_readcb, conn_writecb, conn_eventcb, bev_in);
+    bufferevent_setcb(bev_out, remote_readcb, conn_writecb, conn_eventcb, (void *)evc);
 	bufferevent_enable(bev_out, EV_READ);
+
+	///timeout
+	timeout = event_new(base, -1, 0, timeout_cb, (void *)evc);
+	evutil_timerclear(&tv);
+	tv.tv_sec = BEV_TIMEOUT;
+	event_add(timeout, &tv);
 }
 
 static int 
@@ -215,7 +327,7 @@ init(int argc, char **argv)
 	    (struct sockaddr*)&saddr,
 	    sizeof(saddr));
     assert(listener);
-    
+
     return 0;
 }
 
