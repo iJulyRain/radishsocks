@@ -61,9 +61,11 @@ struct ev_container{
 };
 
 static void 
-reset_timeout(struct event *timeout_ev)
+reset_timer(struct event *timeout_ev)
 {
 	struct timeval tv;
+
+	vlog(INFO, "REST TIMER...\n");
 
     evtimer_del(timeout_ev);
 
@@ -76,6 +78,8 @@ static void
 timeout_cb(evutil_socket_t fd, short event, void *user_data)
 {
 	struct ev_container *evc = user_data;
+
+	vlog(ERROR, "TIMEOUT...\n");
 
 	bufferevent_free(evc->bev_local);
     bufferevent_free(evc->bev_remote);
@@ -130,9 +134,10 @@ remote_readcb(struct bufferevent *bev, void *user_data)
 	char data[datalen + 1];
 	datalen = evbuffer_remove(input, data, datalen);
 
+	vlog(INFO, "REMOTE RECV(%d)\n", datalen);
 	vlog_array(INFO, data, datalen);
 
-    reset_timeout(evc->timeout_ev);
+    reset_timer(evc->timeout_ev);
 
 	switch (evc->stage)
 	{
@@ -168,11 +173,11 @@ local_readcb(struct bufferevent *bev, void *user_data)
 
 	char data[datalen + 1];
 	datalen = evbuffer_remove(input, data, datalen);
-	//vlog(INFO, "(%d)%s\n", datalen, data);
 
+	vlog(INFO, "LOCAL RECV(%d)\n", datalen);
 	vlog_array(INFO, data, datalen);
 
-    reset_timeout(evc->timeout_ev);
+    reset_timer(evc->timeout_ev);
 
 	switch (evc->stage)
 	{
@@ -370,7 +375,7 @@ init(int argc, char **argv)
     while ((option = getopt(argc, argv, "v:s:p:b:l:k:")) > 0){
         switch (option) {
         case 'v':
-	        loglevel++;
+	        loglevel = atoi(optarg);
             break;
         case 's':
             memset(server_ip, 0, sizeof(server_ip));

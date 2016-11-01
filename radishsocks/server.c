@@ -54,12 +54,15 @@ struct ev_container{
 	struct bufferevent *bev_local, *bev_remote;
     struct event *timeout_ev;
     struct sockaddr sa, sa_remote;
+	char domain[256];
 };
 
 static void 
-reset_timeout(struct event *timeout_ev)
+reset_timer(struct event *timeout_ev)
 {
 	struct timeval tv;
+
+	vlog(INFO, "REST TIMER...\n");
 
     evtimer_del(timeout_ev);
 
@@ -72,6 +75,8 @@ static void
 timeout_cb(evutil_socket_t fd, short event, void *user_data)
 {
 	struct ev_container *evc = user_data;
+
+	vlog(ERROR, "TIMEOUT...\n");
 
 	bufferevent_free(evc->bev_local);
     bufferevent_free(evc->bev_remote);
@@ -112,12 +117,6 @@ conn_eventcb(struct bufferevent *bev, short events, void *user_data)
     event_free(evc->timeout_ev);
 }
 
-static void
-dns_cb(int result, char type, int count, int ttl, void *addrs, void *orig)
-{
-
-}
-
 //client read callback
 static void
 remote_readcb(struct bufferevent *bev, void *user_data)
@@ -132,13 +131,81 @@ remote_readcb(struct bufferevent *bev, void *user_data)
 	char data[datalen + 1];
 	datalen = evbuffer_remove(input, data, datalen);
 
+	vlog(INFO, "REMOTE RECV(%d)\n", datalen);
 	vlog_array(INFO, data, datalen);
 
-    reset_timeout(evc->timeout_ev);
+    reset_timer(evc->timeout_ev);
 
     //TODO encrypt
     bufferevent_write(partner, data, datalen);
     bufferevent_enable(partner, EV_WRITE);
+}
+
+static void
+dns_cb(int result, char type, int count, int ttl, void *addrs, void *orig)
+{
+	struct ev_container *evc = orig;
+	int i, rc;
+	uint32_t address = 0;
+	struct sockaddr_in sa;
+    socklen_t addrlen;
+    evutil_socket_t fd;
+    char output[16];
+
+	vlog(INFO, "count = %d\n", count);
+
+	if (!count) {
+		vlog(ERROR, "%s: No answer (%d)\n", evc->domain, result);
+		return;
+	}
+
+	for (i = 0; i < count; i++) {
+		if (type == DNS_IPv4_A) {
+			address = ((uint32_t*)addrs)[i];
+			break;
+		}
+	}
+
+	((struct sockaddr_in *)&evc->sa_remote)->sin_addr.s_addr = address;
+
+	rc = bufferevent_socket_connect(
+		evc->bev_remote,
+		&evc->sa_remote,
+		sizeof(struct sockaddr)
+	);
+	if (rc < 0) {
+		vlog(ERROR, "bufferevent socket connect\n");
+
+		bufferevent_free(evc->bev_local);
+		bufferevent_free(evc->bev_remote);
+
+		evtimer_del(evc->timeout_ev);
+		event_free(evc->timeout_ev);
+
+		return;
+	}
+
+	bufferevent_setcb(evc->bev_remote, remote_readcb, conn_writecb, conn_eventcb, (void *)evc);
+	bufferevent_enable(evc->bev_remote, EV_READ);
+
+	fd = bufferevent_getfd(evc->bev_remote);
+	addrlen = sizeof(sa);
+	getsockname(fd, (struct sockaddr *)&sa, &addrlen);
+
+	memset(output, 0, sizeof(output));
+	output[0] = 0x05;
+	output[1] = 0x00;
+	output[2] = 0x00;
+	output[3] = 0x01;
+	output[4] = 0x00;
+	output[5] = 0x00;
+	output[6] = 0x00;
+	output[7] = 0x00;
+	output[8] = 0x00;
+	output[9] = 0x00;
+
+	bufferevent_write(evc->bev_local, output, 10);
+	bufferevent_enable(evc->bev_local, EV_WRITE);
 }
 
 //local server read callback
@@ -160,16 +227,17 @@ local_readcb(struct bufferevent *bev, void *user_data)
 	char data[datalen + 1];
 
 	datalen = evbuffer_remove(input, data, datalen);
-	//vlog(INFO, "(%d)%s\n", datalen, data);
 
+	vlog(INFO, "LOCAL RECV(%d)\n", datalen);
 	vlog_array(INFO, data, datalen);
 
-    reset_timeout(evc->timeout_ev);
+    reset_timer(evc->timeout_ev);
 
     ((struct sockaddr_in *)&evc->sa_remote)->sin_family = AF_INET;
 
     //<TODO decrypt
-    if (data[0] == 0xFF) { //<addr
+    if ((unsigned char)data[0] == 0xFF) { //<addr
+		vlog(INFO, "connecting...\n");
         if (data[3] == 0x03){ //<domain
             char domain[256];
             size_t domain_size;
@@ -178,14 +246,17 @@ local_readcb(struct bufferevent *bev, void *user_data)
             memset(domain, 0, sizeof(domain));
             memcpy(domain, data + 5, domain_size);
 
+            port = data[5 + domain_size + 0] << 8 | data[5 + domain_size + 1] << 0;
+
             vlog(DEBUG, "connection %s:%d from %s:%d\n",
                 domain,
                 port,
                 inet_ntoa(((struct sockaddr_in *)&evc->sa)->sin_addr),
                 ntohs(((struct sockaddr_in *)&evc->sa)->sin_port)
             );
+			strncpy(evc->domain, domain, strlen(domain));
             evdns_base_resolve_ipv4(evdns_base, domain, 0, dns_cb, (void *)evc);
-            port = data[5 + domain_size + 0] << 8 | data[5 + domain_size + 1] << 0;
+
             ((struct sockaddr_in *)&evc->sa_remote)->sin_port = htons(port);
         } else if (data[3] == 0x01) { //<ip
             port = data[8] << 8 | data[9] << 0;
@@ -215,6 +286,8 @@ local_readcb(struct bufferevent *bev, void *user_data)
 
                 return;
             }
+			bufferevent_setcb(partner, remote_readcb, conn_writecb, conn_eventcb, (void *)evc);
+			bufferevent_enable(partner, EV_READ);
 
             fd = bufferevent_getfd(partner);
             addrlen = sizeof(sa);
@@ -236,6 +309,7 @@ local_readcb(struct bufferevent *bev, void *user_data)
             bufferevent_enable(bev, EV_WRITE);
         }
     } else { //<stream
+		vlog(INFO, "stream...\n");
         //<TODO decrypt
         bufferevent_write(partner, data, datalen);
         bufferevent_enable(partner, EV_WRITE);
@@ -281,11 +355,6 @@ listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
 	bufferevent_setcb(bev_in, local_readcb, conn_writecb, conn_eventcb, (void *)evc);
 	bufferevent_enable(bev_in, EV_READ);
 
-	//==========================================================
-	//<remote
-    bufferevent_setcb(bev_out, remote_readcb, conn_writecb, conn_eventcb, (void *)evc);
-	bufferevent_enable(bev_out, EV_READ);
-
 	///timeout
 	timeout = evtimer_new(base, timeout_cb, (void *)evc);
     evc->timeout_ev = timeout;
@@ -322,7 +391,7 @@ init(int argc, char **argv)
     while ((option = getopt(argc, argv, "v:b:l:k:")) > 0){
         switch (option) {
         case 'v':
-	        loglevel++;
+	        loglevel = atoi(optarg);
             break;
         case 'b':
             memset(bind_ip, 0, sizeof(bind_ip));
@@ -357,7 +426,9 @@ init(int argc, char **argv)
 
     evdns_base = evdns_base_new(base, 0);
     assert(evdns_base);
-    rc = evdns_base_nameserver_ip_add(evdns_base, "114.114.114.114");
+
+    //rc = evdns_base_nameserver_ip_add(evdns_base, "114.114.114.114");
+	rc = evdns_base_resolv_conf_parse(evdns_base, DNS_OPTION_NAMESERVERS, "/etc/resolv.conf");
     if (rc < 0){
         vlog(ERROR, "Couldn't configure nameserver");
         return -2;

@@ -44,7 +44,7 @@ void vlog_array(int level, char arr[], int arr_size)
 	printf("[%s] ", header[level]);
 
 	for (i = 0; i < arr_size; i++)
-		printf("%#02X ", arr[i]);
+		printf("%#02x ", (unsigned char)arr[i]);
 	
 	printf("\n");
 }
