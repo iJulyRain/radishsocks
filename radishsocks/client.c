@@ -42,9 +42,9 @@
 #include "log.h"
 
 static struct event_base *base;
-static char server_ip[16];
-static char server_pwd[64];
-static int  server_port;
+static char server_ip[16] = "";
+static char server_pwd[64] = "";
+static int  server_port = 0;
 
 #define STAGE_INIT    0x00
 #define STAGE_VERSION 0x01
@@ -55,10 +55,32 @@ static int  server_port;
 
 struct ev_container{
 	struct bufferevent *bev_local, *bev_remote;
-	int bev_local_timeout, bev_remote_timeout;
+    struct event *timeout_ev;
 
 	int stage;
 };
+
+static void 
+reset_timeout(struct event *timeout_ev)
+{
+	struct timeval tv;
+
+    evtimer_del(timeout_ev);
+
+	evutil_timerclear(&tv);
+	tv.tv_sec = BEV_TIMEOUT;
+	evtimer_add(timeout_ev, &tv);
+}
+
+static void
+timeout_cb(evutil_socket_t fd, short event, void *user_data)
+{
+	struct ev_container *evc = user_data;
+
+	bufferevent_free(evc->bev_local);
+    bufferevent_free(evc->bev_remote);
+    event_free(evc->timeout_ev);
+}
 
 static void
 conn_writecb(struct bufferevent *bev, void *user_data)
@@ -89,6 +111,9 @@ conn_eventcb(struct bufferevent *bev, short events, void *user_data)
 	 * timeouts */
 	bufferevent_free(evc->bev_local);
     bufferevent_free(evc->bev_remote);
+
+    evtimer_del(evc->timeout_ev);
+    event_free(evc->timeout_ev);
 }
 
 //client read callback
@@ -106,6 +131,8 @@ remote_readcb(struct bufferevent *bev, void *user_data)
 	datalen = evbuffer_remove(input, data, datalen);
 
 	vlog_array(INFO, data, datalen);
+
+    reset_timeout(evc->timeout_ev);
 
 	switch (evc->stage)
 	{
@@ -145,6 +172,8 @@ local_readcb(struct bufferevent *bev, void *user_data)
 
 	vlog_array(INFO, data, datalen);
 
+    reset_timeout(evc->timeout_ev);
+
 	switch (evc->stage)
 	{
 		case STAGE_INIT:
@@ -157,12 +186,16 @@ local_readcb(struct bufferevent *bev, void *user_data)
 				vlog(ERROR, "Socks5 method header too short\n");
 				bufferevent_free(bev);
 				bufferevent_free(partner);
+
+                break;
 			}
 
 			if (data[0] != 0x05){
 				vlog(ERROR, "Only Supported Socks5\n");
 				bufferevent_free(bev);
 				bufferevent_free(partner);
+
+                break;
 			}
 
 			nmethods = data[1];
@@ -171,6 +204,8 @@ local_readcb(struct bufferevent *bev, void *user_data)
 				vlog(ERROR, "Socks5 NMETHODs and METHODS not match\n");
 				bufferevent_free(bev);
 				bufferevent_free(partner);
+
+                break;
 			}
 			
 			for (i = 0; i < nmethods; i++){
@@ -186,6 +221,11 @@ local_readcb(struct bufferevent *bev, void *user_data)
 				output[1] = 0x00;
 			else if (pwdauth)
 				output[1] = 0x02;
+            else{
+				vlog(ERROR, "Socks5 METHODS need 0,2\n");
+				bufferevent_free(bev);
+				bufferevent_free(partner);
+            }
 
 			bufferevent_write(bev, output, 2);
 			bufferevent_enable(bev, EV_WRITE);
@@ -195,7 +235,24 @@ local_readcb(struct bufferevent *bev, void *user_data)
 			break;
 		case STAGE_VERSION:
 		{
+			if (data[0] != 0x05){
+				vlog(ERROR, "Only Supported Socks5\n");
+				bufferevent_free(bev);
+				bufferevent_free(partner);
+
+                break;
+			}
+
+            if (data[1] != 0x01){
+				vlog(ERROR, "Only Supported TCP relay\n");
+				bufferevent_free(bev);
+				bufferevent_free(partner);
+
+                break;
+            }
+
 			//TODO encrypt
+            data[0] = 0xFF;
 			bufferevent_write(partner, data, datalen);
 			bufferevent_enable(partner, EV_WRITE);
 
@@ -210,15 +267,6 @@ local_readcb(struct bufferevent *bev, void *user_data)
 		}
 			break;
 	}
-}
-
-static void
-timeout_cb(evutil_socket_t fd, short event, void *user_data)
-{
-	struct ev_container *evc = user_data;
-
-	bufferevent_free(evc->bev_local);
-    bufferevent_free(evc->bev_remote);
 }
 
 static void
@@ -286,10 +334,25 @@ listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
 	bufferevent_enable(bev_out, EV_READ);
 
 	///timeout
-	timeout = event_new(base, -1, 0, timeout_cb, (void *)evc);
+	timeout = evtimer_new(base, timeout_cb, (void *)evc);
+    evc->timeout_ev = timeout;
 	evutil_timerclear(&tv);
 	tv.tv_sec = BEV_TIMEOUT;
-	event_add(timeout, &tv);
+	evtimer_add(timeout, &tv);
+}
+
+static void 
+usage()
+{
+    vlog(ERROR, 
+        "Usage: \n"
+        "\t-v <verbose>: 0 DEFAULT/1 DEBUG/2 INFO\n"
+        "\t-s <serverIP>: rsserver address\n"
+        "\t-p <serverPort>: rsserver listen port\n"
+        "\t-b <localAddress>: local bind address\n"
+        "\t-l <localPort>: local bind port\n"
+        "\t-k <password>: password\n"
+    );
 }
 
 static int 
@@ -297,26 +360,61 @@ init(int argc, char **argv)
 {
 	struct evconnlistener *listener;
 	struct sockaddr_in saddr;
+    int option;
+    char bind_ip[16] = "";
+    int bind_port = 0;
+
+    loglevel = ERROR;
 
     //TODO options
-    if (argc < 6){
-        vlog(ERROR, "usage: ./%s server_ip server_port local_ip local_port password\n", basename(argv[0]));
-        return -1;
+    while ((option = getopt(argc, argv, "v:s:p:b:l:k:")) > 0){
+        switch (option) {
+        case 'v':
+	        loglevel++;
+            break;
+        case 's':
+            memset(server_ip, 0, sizeof(server_ip));
+            strncpy(server_ip, optarg, sizeof(server_ip) - 1);
+            break;
+        case 'p':
+            server_port = atoi(optarg);
+            break;
+        case 'b':
+            memset(bind_ip, 0, sizeof(bind_ip));
+            strncpy(bind_ip, optarg, sizeof(bind_ip) - 1);
+            break;
+        case 'l':
+            bind_port = atoi(optarg);
+            break;
+        case 'k':
+            memset(server_pwd, 0, sizeof(server_pwd));
+            strncpy(server_pwd, optarg, sizeof(server_pwd) - 1);
+            break;
+        default:
+            break;
+        }
     }
 
-	loglevel = INFO;
+    if (server_ip[0] == '\0' || server_pwd[0] == '\0'){
+        usage();
+        return -1; 
+    }
+    if (server_port == 0)
+        server_port = 8575;
+    if (bind_port == 0)
+        bind_port = 1080;
+    if (bind_ip[0] == '\0')
+        strcpy(bind_ip, "0.0.0.0");
+
+    vlog(DEBUG, "listen %s:%d\n", bind_ip, bind_port);
 
     base = event_base_new();
     assert(base);
 
-    strncpy(server_ip, argv[1], 15);
-    strncpy(server_pwd, argv[5], 63);
-    server_port = atoi(argv[2]);
-
     memset(&saddr, 0, sizeof(struct sockaddr_in));
     saddr.sin_family = AF_INET;
-    saddr.sin_port = htons(atoi(argv[4]));
-    saddr.sin_addr.s_addr = inet_addr(argv[3]);
+    saddr.sin_port = htons(bind_port);
+    saddr.sin_addr.s_addr = inet_addr(bind_ip);
 
     listener = evconnlistener_new_bind(
         base,
@@ -344,7 +442,7 @@ main(int argc, char **argv)
 
     rc = init(argc, argv);
     if (rc != 0) {
-        vlog(ERROR, "initial fatal!\n");
+        vlog(ERROR, "initial error!\n");
         return -1;
     }
 

@@ -27,7 +27,7 @@ void vlog(int level, const char *format, ...)
     if (level > loglevel)
         return ;
 
-	printf("[%s][%d][%s] ", __FILE__, __LINE__, header[level]);
+	printf("[%s] ", header[level]);
 
     va_start(ap, format);
     vprintf(format, ap);
@@ -41,7 +41,7 @@ void vlog_array(int level, char arr[], int arr_size)
     if (level > loglevel)
         return ;
 
-	printf("[%s][%d][%s] ", __FILE__, __LINE__, header[level]);
+	printf("[%s] ", header[level]);
 
 	for (i = 0; i < arr_size; i++)
 		printf("%#02X ", arr[i]);
