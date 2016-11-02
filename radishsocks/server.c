@@ -76,7 +76,7 @@ timeout_cb(evutil_socket_t fd, short event, void *user_data)
 {
 	struct ev_container *evc = user_data;
 
-	vlog(ERROR, "TIMEOUT...\n");
+	vlog(ERROR, "%s TIMEOUT...\n", evc->domain);
 
 	bufferevent_free(evc->bev_local);
     bufferevent_free(evc->bev_remote);
@@ -201,8 +201,8 @@ dns_cb(int result, char type, int count, int ttl, void *addrs, void *orig)
 	output[5] = 0x00;
 	output[6] = 0x00;
 	output[7] = 0x00;
-	output[8] = 0x00;
-	output[9] = 0x00;
+	output[8] = 0x10;
+	output[9] = 0x10;
 
 	bufferevent_write(evc->bev_local, output, 10);
 	bufferevent_enable(evc->bev_local, EV_WRITE);
@@ -237,12 +237,21 @@ local_readcb(struct bufferevent *bev, void *user_data)
 
     //<TODO decrypt
     if ((unsigned char)data[0] == 0xFF) { //<addr
-		vlog(INFO, "connecting...\n");
         if (data[3] == 0x03){ //<domain
             char domain[256];
             size_t domain_size;
 
             domain_size = data[4];
+            if (datalen < (7 + domain_size)){
+                bufferevent_free(bev);
+                bufferevent_free(partner);
+
+                evtimer_del(evc->timeout_ev);
+                event_free(evc->timeout_ev);
+
+                return;
+            }
+                
             memset(domain, 0, sizeof(domain));
             memcpy(domain, data + 5, domain_size);
 
@@ -259,6 +268,16 @@ local_readcb(struct bufferevent *bev, void *user_data)
 
             ((struct sockaddr_in *)&evc->sa_remote)->sin_port = htons(port);
         } else if (data[3] == 0x01) { //<ip
+            if (datalen < 10){
+                bufferevent_free(bev);
+                bufferevent_free(partner);
+
+                evtimer_del(evc->timeout_ev);
+                event_free(evc->timeout_ev);
+
+                return;
+            }
+
             port = data[8] << 8 | data[9] << 0;
             ((struct sockaddr_in *)&evc->sa_remote)->sin_port = htons(port);
             memcpy(&((struct sockaddr_in *)&evc->sa_remote)->sin_addr.s_addr, data + 4, 4);
@@ -302,14 +321,13 @@ local_readcb(struct bufferevent *bev, void *user_data)
             output[5] = 0x00;
             output[6] = 0x00;
             output[7] = 0x00;
-            output[8] = 0x00;
-            output[9] = 0x00;
+            output[8] = 0x10;
+            output[9] = 0x10;
 
             bufferevent_write(bev, output, 10);
             bufferevent_enable(bev, EV_WRITE);
         }
     } else { //<stream
-		vlog(INFO, "stream...\n");
         //<TODO decrypt
         bufferevent_write(partner, data, datalen);
         bufferevent_enable(partner, EV_WRITE);

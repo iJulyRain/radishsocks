@@ -10,10 +10,16 @@ add_definitions(-DVER_RELEASE)
 
 set(EXECUTABLE_OUTPUT_PATH ${PROJECT_BINARY_DIR}/output)
 set(LIBRARY_OUTPUT_PATH ${PROJECT_BINARY_DIR}/output)
-set(CMAKE_C_FLAGS "-Wall -O2")
+set(CMAKE_C_FLAGS "-Wall -g ")
 
-include_directories(${PROJECT_SOURCE_DIR}/radishsocks/)
+include_directories(
+${PROJECT_SOURCE_DIR}/radishsocks/
+${PROJECT_SOURCE_DIR}/libevent/include/
+)
 
-link_directories(${PROJECT_SOURCE_DIR}/radishsocks/)
+link_directories(
+${PROJECT_SOURCE_DIR}/radishsocks/
+${PROJECT_SOURCE_DIR}/libevent/lib/
+)
 
 add_subdirectory(radishsocks)
