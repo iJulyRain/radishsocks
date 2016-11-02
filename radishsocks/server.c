@@ -57,10 +57,35 @@ struct ev_container{
 	char domain[256];
 };
 
+static void
+free_ev_container(struct ev_container *evc)
+{
+	if (evc->bev_local){
+		bufferevent_free(evc->bev_local);
+		evc->bev_local = NULL;
+	}
+	
+	if (evc->bev_remote){
+    	bufferevent_free(evc->bev_remote);
+		evc->bev_remote = NULL;
+	}
+	
+	if (evc->timeout_ev){
+		evtimer_del(evc->timeout_ev);
+		event_free(evc->timeout_ev);
+		evc->timeout_ev = NULL;
+	}
+
+	free(evc);
+}
+
 static void 
 reset_timer(struct event *timeout_ev)
 {
 	struct timeval tv;
+
+	if (!timeout_ev)
+		return;
 
 	vlog(INFO, "REST TIMER...\n");
 
@@ -78,9 +103,7 @@ timeout_cb(evutil_socket_t fd, short event, void *user_data)
 
 	vlog(ERROR, "%s TIMEOUT...\n", evc->domain);
 
-	bufferevent_free(evc->bev_local);
-    bufferevent_free(evc->bev_remote);
-    event_free(evc->timeout_ev);
+	free_ev_container(evc);
 }
 
 static void
@@ -110,11 +133,7 @@ conn_eventcb(struct bufferevent *bev, short events, void *user_data)
 
 	/* None of the other events can happen here, since we haven't enabled
 	 * timeouts */
-	bufferevent_free(evc->bev_local);
-    bufferevent_free(evc->bev_remote);
-
-    evtimer_del(evc->timeout_ev);
-    event_free(evc->timeout_ev);
+	free_ev_container(evc);
 }
 
 //client read callback
@@ -125,13 +144,15 @@ remote_readcb(struct bufferevent *bev, void *user_data)
 	struct ev_container *evc = user_data;
     struct bufferevent *partner = evc->bev_local;
 	ev_ssize_t datalen = 0;
+	char *data = NULL;
 
 	datalen = evbuffer_get_length(input); 
+	data = (char *)calloc(1, datalen + 1);
+	assert(data);
 
-	char data[datalen + 1];
 	datalen = evbuffer_remove(input, data, datalen);
+	vlog(DEBUG, "REMOTE RECV(%d)\n", datalen);
 
-	vlog(INFO, "REMOTE RECV(%d)\n", datalen);
 	vlog_array(INFO, data, datalen);
 
     reset_timer(evc->timeout_ev);
@@ -139,6 +160,8 @@ remote_readcb(struct bufferevent *bev, void *user_data)
     //TODO encrypt
     bufferevent_write(partner, data, datalen);
     bufferevent_enable(partner, EV_WRITE);
+
+	free(data);
 }
 
 static void
@@ -151,8 +174,6 @@ dns_cb(int result, char type, int count, int ttl, void *addrs, void *orig)
     socklen_t addrlen;
     evutil_socket_t fd;
     char output[16];
-
-	vlog(INFO, "count = %d\n", count);
 
 	if (!count) {
 		vlog(ERROR, "%s: No answer (%d)\n", evc->domain, result);
@@ -176,12 +197,7 @@ dns_cb(int result, char type, int count, int ttl, void *addrs, void *orig)
 	if (rc < 0) {
 		vlog(ERROR, "bufferevent socket connect\n");
 
-		bufferevent_free(evc->bev_local);
-		bufferevent_free(evc->bev_remote);
-
-		evtimer_del(evc->timeout_ev);
-		event_free(evc->timeout_ev);
-
+		free_ev_container(evc);
 		return;
 	}
 
@@ -222,116 +238,108 @@ local_readcb(struct bufferevent *bev, void *user_data)
     struct sockaddr_in sa;
     socklen_t addrlen;
     char output[16];
+	char *data = NULL;
    
 	datalen = evbuffer_get_length(input); 
-	char data[datalen + 1];
+
+	data = (char *)calloc(1, datalen + 1);
+	assert(data);
 
 	datalen = evbuffer_remove(input, data, datalen);
+	vlog(DEBUG, "LOCAL RECV(%d)\n", datalen);
 
-	vlog(INFO, "LOCAL RECV(%d)\n", datalen);
 	vlog_array(INFO, data, datalen);
 
     reset_timer(evc->timeout_ev);
 
     ((struct sockaddr_in *)&evc->sa_remote)->sin_family = AF_INET;
 
-    //<TODO decrypt
-    if ((unsigned char)data[0] == 0xFF) { //<addr
-        if (data[3] == 0x03){ //<domain
-            char domain[256];
-            size_t domain_size;
+	do{
+		//<TODO decrypt
+		if ((unsigned char)data[0] == 0xFF) { //<addr
+			if (data[3] == 0x03){ //<domain
+				char domain[256];
+				size_t domain_size;
 
-            domain_size = data[4];
-            if (datalen < (7 + domain_size)){
-                bufferevent_free(bev);
-                bufferevent_free(partner);
+				domain_size = data[4];
+				if (datalen < (7 + domain_size)){
+					free_ev_container(evc);
+					break;
+				}
+					
+				memset(domain, 0, sizeof(domain));
+				memcpy(domain, data + 5, domain_size);
 
-                evtimer_del(evc->timeout_ev);
-                event_free(evc->timeout_ev);
+				port = data[5 + domain_size + 0] << 8 | data[5 + domain_size + 1] << 0;
 
-                return;
-            }
-                
-            memset(domain, 0, sizeof(domain));
-            memcpy(domain, data + 5, domain_size);
+				vlog(DEBUG, "connection %s:%d from %s:%d\n",
+					domain,
+					port,
+					inet_ntoa(((struct sockaddr_in *)&evc->sa)->sin_addr),
+					ntohs(((struct sockaddr_in *)&evc->sa)->sin_port)
+				);
+				strncpy(evc->domain, domain, strlen(domain));
+				evdns_base_resolve_ipv4(evdns_base, domain, 0, dns_cb, (void *)evc);
 
-            port = data[5 + domain_size + 0] << 8 | data[5 + domain_size + 1] << 0;
+				((struct sockaddr_in *)&evc->sa_remote)->sin_port = htons(port);
+			} else if (data[3] == 0x01) { //<ip
+				if (datalen < 10){
+					free_ev_container(evc);
+					break;
+				}
 
-            vlog(DEBUG, "connection %s:%d from %s:%d\n",
-                domain,
-                port,
-                inet_ntoa(((struct sockaddr_in *)&evc->sa)->sin_addr),
-                ntohs(((struct sockaddr_in *)&evc->sa)->sin_port)
-            );
-			strncpy(evc->domain, domain, strlen(domain));
-            evdns_base_resolve_ipv4(evdns_base, domain, 0, dns_cb, (void *)evc);
+				port = data[8] << 8 | data[9] << 0;
+				((struct sockaddr_in *)&evc->sa_remote)->sin_port = htons(port);
+				memcpy(&((struct sockaddr_in *)&evc->sa_remote)->sin_addr.s_addr, data + 4, 4);
 
-            ((struct sockaddr_in *)&evc->sa_remote)->sin_port = htons(port);
-        } else if (data[3] == 0x01) { //<ip
-            if (datalen < 10){
-                bufferevent_free(bev);
-                bufferevent_free(partner);
+				vlog(DEBUG, "connection %s:%d from %s:%d\n",
+					inet_ntoa(((struct sockaddr_in *)&evc->sa_remote)->sin_addr),
+					port,
+					inet_ntoa(((struct sockaddr_in *)&evc->sa)->sin_addr),
+					ntohs(((struct sockaddr_in *)&evc->sa)->sin_port)
+				);
 
-                evtimer_del(evc->timeout_ev);
-                event_free(evc->timeout_ev);
+				rc = bufferevent_socket_connect(
+					partner,
+					&evc->sa_remote,
+					sizeof(struct sockaddr)
+				);
+				if (rc < 0) {
+					vlog(ERROR, "bufferevent socket connect\n");
 
-                return;
-            }
+					free_ev_container(evc);
+					break;
+				}
+				bufferevent_setcb(partner, remote_readcb, conn_writecb, conn_eventcb, (void *)evc);
+				bufferevent_enable(partner, EV_READ);
 
-            port = data[8] << 8 | data[9] << 0;
-            ((struct sockaddr_in *)&evc->sa_remote)->sin_port = htons(port);
-            memcpy(&((struct sockaddr_in *)&evc->sa_remote)->sin_addr.s_addr, data + 4, 4);
+				fd = bufferevent_getfd(partner);
+				addrlen = sizeof(sa);
+				getsockname(fd, (struct sockaddr *)&sa, &addrlen);
 
-            vlog(DEBUG, "connection %s:%d from %s:%d\n",
-                inet_ntoa(((struct sockaddr_in *)&evc->sa_remote)->sin_addr),
-                port,
-                inet_ntoa(((struct sockaddr_in *)&evc->sa)->sin_addr),
-                ntohs(((struct sockaddr_in *)&evc->sa)->sin_port)
-            );
+				memset(output, 0, sizeof(output));
+				output[0] = 0x05;
+				output[1] = 0x00;
+				output[2] = 0x00;
+				output[3] = 0x01;
+				output[4] = 0x00;
+				output[5] = 0x00;
+				output[6] = 0x00;
+				output[7] = 0x00;
+				output[8] = 0x10;
+				output[9] = 0x10;
 
-            rc = bufferevent_socket_connect(
-                partner,
-                &evc->sa_remote,
-                sizeof(struct sockaddr)
-            );
-            if (rc < 0) {
-                vlog(ERROR, "bufferevent socket connect\n");
+				bufferevent_write(bev, output, 10);
+				bufferevent_enable(bev, EV_WRITE);
+			}
+		} else { //<stream
+			//<TODO decrypt
+			bufferevent_write(partner, data, datalen);
+			bufferevent_enable(partner, EV_WRITE);
+		}
 
-                bufferevent_free(bev);
-                bufferevent_free(partner);
-
-                evtimer_del(evc->timeout_ev);
-                event_free(evc->timeout_ev);
-
-                return;
-            }
-			bufferevent_setcb(partner, remote_readcb, conn_writecb, conn_eventcb, (void *)evc);
-			bufferevent_enable(partner, EV_READ);
-
-            fd = bufferevent_getfd(partner);
-            addrlen = sizeof(sa);
-            getsockname(fd, (struct sockaddr *)&sa, &addrlen);
-
-            memset(output, 0, sizeof(output));
-            output[0] = 0x05;
-            output[1] = 0x00;
-            output[2] = 0x00;
-            output[3] = 0x01;
-            output[4] = 0x00;
-            output[5] = 0x00;
-            output[6] = 0x00;
-            output[7] = 0x00;
-            output[8] = 0x10;
-            output[9] = 0x10;
-
-            bufferevent_write(bev, output, 10);
-            bufferevent_enable(bev, EV_WRITE);
-        }
-    } else { //<stream
-        //<TODO decrypt
-        bufferevent_write(partner, data, datalen);
-        bufferevent_enable(partner, EV_WRITE);
-    }
+		free(data);
+	}while(0);
 }
 
 static void
@@ -347,14 +355,14 @@ listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
 	vlog(DEBUG, "new client from %s:%d\n", 
 		inet_ntoa(((struct sockaddr_in *)sa)->sin_addr), ntohs(((struct sockaddr_in *)sa)->sin_port));
 
-	bev_in = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
+	bev_in = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE);
 	if (!bev_in) {
 		vlog(ERROR, "Error constructing bufferevent (input)!");
 		event_base_loopbreak(base);
 		return;
 	}
 
-	bev_out = bufferevent_socket_new(base, -1, BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
+	bev_out = bufferevent_socket_new(base, -1, BEV_OPT_CLOSE_ON_FREE);
 	if (!bev_out) {
 		vlog(ERROR, "Error constructing bufferevent (input)!");
 		event_base_loopbreak(base);

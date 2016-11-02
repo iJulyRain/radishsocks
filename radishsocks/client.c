@@ -60,6 +60,28 @@ struct ev_container{
 	int stage;
 };
 
+static void
+free_ev_container(struct ev_container *evc)
+{
+	if (evc->bev_local){
+		bufferevent_free(evc->bev_local);
+		evc->bev_local = NULL;
+	}
+	
+	if (evc->bev_remote){
+    	bufferevent_free(evc->bev_remote);
+		evc->bev_remote = NULL;
+	}
+	
+	if (evc->timeout_ev){
+		evtimer_del(evc->timeout_ev);
+		event_free(evc->timeout_ev);
+		evc->timeout_ev = NULL;
+	}
+
+	free(evc);
+}
+
 static void 
 reset_timer(struct event *timeout_ev)
 {
@@ -81,9 +103,7 @@ timeout_cb(evutil_socket_t fd, short event, void *user_data)
 
 	vlog(ERROR, "TIMEOUT...\n");
 
-	bufferevent_free(evc->bev_local);
-    bufferevent_free(evc->bev_remote);
-    event_free(evc->timeout_ev);
+	free_ev_container(evc);
 }
 
 static void
@@ -113,11 +133,7 @@ conn_eventcb(struct bufferevent *bev, short events, void *user_data)
 
 	/* None of the other events can happen here, since we haven't enabled
 	 * timeouts */
-	bufferevent_free(evc->bev_local);
-    bufferevent_free(evc->bev_remote);
-
-    evtimer_del(evc->timeout_ev);
-    event_free(evc->timeout_ev);
+	free_ev_container(evc);
 }
 
 //client read callback
@@ -134,7 +150,7 @@ remote_readcb(struct bufferevent *bev, void *user_data)
 	char data[datalen + 1];
 	datalen = evbuffer_remove(input, data, datalen);
 
-	vlog(INFO, "REMOTE RECV(%d)\n", datalen);
+	vlog(DEBUG, "REMOTE RECV(%d)\n", datalen);
 	vlog_array(INFO, data, datalen);
 
     reset_timer(evc->timeout_ev);
@@ -174,7 +190,7 @@ local_readcb(struct bufferevent *bev, void *user_data)
 	char data[datalen + 1];
 	datalen = evbuffer_remove(input, data, datalen);
 
-	vlog(INFO, "LOCAL RECV(%d)\n", datalen);
+	vlog(DEBUG, "LOCAL RECV(%d)\n", datalen);
 	vlog_array(INFO, data, datalen);
 
     reset_timer(evc->timeout_ev);
@@ -189,17 +205,13 @@ local_readcb(struct bufferevent *bev, void *user_data)
 
 			if (datalen < 3){
 				vlog(ERROR, "Socks5 method header too short\n");
-				bufferevent_free(bev);
-				bufferevent_free(partner);
-
+				free_ev_container(evc);
                 break;
 			}
 
 			if (data[0] != 0x05){
 				vlog(ERROR, "Only Supported Socks5\n");
-				bufferevent_free(bev);
-				bufferevent_free(partner);
-
+				free_ev_container(evc);
                 break;
 			}
 
@@ -207,9 +219,7 @@ local_readcb(struct bufferevent *bev, void *user_data)
 
 			if (nmethods < 1 || datalen != (nmethods + 2)){
 				vlog(ERROR, "Socks5 NMETHODs and METHODS not match\n");
-				bufferevent_free(bev);
-				bufferevent_free(partner);
-
+				free_ev_container(evc);
                 break;
 			}
 			
@@ -228,8 +238,7 @@ local_readcb(struct bufferevent *bev, void *user_data)
 				output[1] = 0x02;
             else{
 				vlog(ERROR, "Socks5 METHODS need 0,2\n");
-				bufferevent_free(bev);
-				bufferevent_free(partner);
+				free_ev_container(evc);
             }
 
 			bufferevent_write(bev, output, 2);
@@ -242,16 +251,14 @@ local_readcb(struct bufferevent *bev, void *user_data)
 		{
 			if (data[0] != 0x05){
 				vlog(ERROR, "Only Supported Socks5\n");
-				bufferevent_free(bev);
-				bufferevent_free(partner);
+				free_ev_container(evc);
 
                 break;
 			}
 
             if (data[1] != 0x01){
 				vlog(ERROR, "Only Supported TCP relay\n");
-				bufferevent_free(bev);
-				bufferevent_free(partner);
+				free_ev_container(evc);
 
                 break;
             }
@@ -328,10 +335,7 @@ listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
 	);
 	if (rc < 0) {
 		vlog(ERROR, "bufferevent socket connect\n");
-
-		bufferevent_free(bev_in);
-		bufferevent_free(bev_out);
-
+		free_ev_container(evc);
 		return;
 	}
 
