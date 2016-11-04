@@ -155,25 +155,9 @@ remote_readcb(struct bufferevent *bev, void *user_data)
 
     reset_timer(evc->timeout_ev);
 
-	switch (evc->stage)
-	{
-		case STAGE_ADDR:
-		{
-			//TODO decrypt
-			bufferevent_write(partner, data, datalen);
-			bufferevent_enable(partner, EV_WRITE);
-
-			evc->stage = STAGE_STREAM;
-		}
-			break;
-		case STAGE_STREAM:
-		{
-			//TODO decrypt
-			bufferevent_write(partner, data, datalen);
-			bufferevent_enable(partner, EV_WRITE);
-		}
-			break;
-	}
+	//TODO decrypt
+	bufferevent_write(partner, data, datalen);
+	bufferevent_enable(partner, EV_WRITE);
 }
 
 //local server read callback
@@ -184,10 +168,11 @@ local_readcb(struct bufferevent *bev, void *user_data)
 	struct ev_container *evc = user_data;
     struct bufferevent *partner = evc->bev_remote;
 	ev_ssize_t datalen = 0;
+	char *data = NULL;
+    char output[16];
    
 	datalen = evbuffer_get_length(input); 
-
-	char data[datalen + 1];
+	data = (char *)calloc(datalen + 1, sizeof(char));
 	datalen = evbuffer_remove(input, data, datalen);
 
 	vlog(DEBUG, "LOCAL RECV(%d)\n", datalen);
@@ -201,7 +186,6 @@ local_readcb(struct bufferevent *bev, void *user_data)
 		{
 			int i, method, nmethods = 0;
 			int noauth = 0, pwdauth = 0;
-			char output[4];
 
 			if (datalen < 3){
 				vlog(ERROR, "Socks5 method header too short\n");
@@ -268,7 +252,22 @@ local_readcb(struct bufferevent *bev, void *user_data)
 			bufferevent_write(partner, data, datalen);
 			bufferevent_enable(partner, EV_WRITE);
 
-			evc->stage = STAGE_ADDR;
+			memset(output, 0, sizeof(output));
+			output[0] = 0x05;
+			output[1] = 0x00;
+			output[2] = 0x00;
+			output[3] = 0x01;
+			output[4] = 0x00;
+			output[5] = 0x00;
+			output[6] = 0x00;
+			output[7] = 0x00;
+			output[8] = 0x10;
+			output[9] = 0x10;
+
+			bufferevent_write(bev, output, 10);
+			bufferevent_enable(bev, EV_WRITE);
+
+			evc->stage = STAGE_STREAM;
 		}
 			break;
 		case STAGE_STREAM:
@@ -279,6 +278,8 @@ local_readcb(struct bufferevent *bev, void *user_data)
 		}
 			break;
 	}
+
+	free(data);
 }
 
 static void

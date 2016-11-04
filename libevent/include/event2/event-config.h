@@ -21,7 +21,7 @@
 /* #undef EVENT__DISABLE_MM_REPLACEMENT */
 
 /* Define if libevent should not be compiled with thread support */
-/* #undef EVENT__DISABLE_THREAD_SUPPORT */
+#define EVENT__DISABLE_THREAD_SUPPORT 1
 
 /* Define to 1 if you have the `accept4' function. */
 #define EVENT__HAVE_ACCEPT4 1
@@ -199,7 +199,7 @@
 /* #undef EVENT__HAVE_PTHREAD */
 
 /* Define if we have pthreads on this system */
-#define EVENT__HAVE_PTHREADS 1
+/* #undef EVENT__HAVE_PTHREADS */
 
 /* Define to 1 if you have the `putenv' function. */
 #define EVENT__HAVE_PUTENV 1
@@ -411,8 +411,7 @@
 /* Define to 1 if you have the <zlib.h> header file. */
 #define EVENT__HAVE_ZLIB_H 1
 
-/* Define to the sub-directory in which libtool stores uninstalled libraries.
-   */
+/* Define to the sub-directory where libtool stores uninstalled libraries. */
 #define EVENT__LT_OBJDIR ".libs/"
 
 /* Numeric representation of the version */
@@ -456,7 +455,7 @@
 #define EVENT__SIZEOF_OFF_T 8
 
 /* The size of `pthread_t', as computed by sizeof. */
-#define EVENT__SIZEOF_PTHREAD_T 8
+/* #undef EVENT__SIZEOF_PTHREAD_T */
 
 /* The size of `short', as computed by sizeof. */
 #define EVENT__SIZEOF_SHORT 2

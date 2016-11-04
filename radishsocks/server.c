@@ -60,6 +60,8 @@ struct ev_container{
 static void
 free_ev_container(struct ev_container *evc)
 {
+	vlog(DEBUG, "(%s)%p free ev container\n", evc->domain, evc);
+
 	if (evc->bev_local){
 		bufferevent_free(evc->bev_local);
 		evc->bev_local = NULL;
@@ -147,7 +149,7 @@ remote_readcb(struct bufferevent *bev, void *user_data)
 	char *data = NULL;
 
 	datalen = evbuffer_get_length(input); 
-	data = (char *)calloc(1, datalen + 1);
+	data = (char *)calloc(datalen + 1, sizeof(char));
 	assert(data);
 
 	datalen = evbuffer_remove(input, data, datalen);
@@ -170,10 +172,6 @@ dns_cb(int result, char type, int count, int ttl, void *addrs, void *orig)
 	struct ev_container *evc = orig;
 	int i, rc;
 	uint32_t address = 0;
-	struct sockaddr_in sa;
-    socklen_t addrlen;
-    evutil_socket_t fd;
-    char output[16];
 
 	if (!count) {
 		vlog(ERROR, "%s: No answer (%d)\n", evc->domain, result);
@@ -203,25 +201,6 @@ dns_cb(int result, char type, int count, int ttl, void *addrs, void *orig)
 
 	bufferevent_setcb(evc->bev_remote, remote_readcb, conn_writecb, conn_eventcb, (void *)evc);
 	bufferevent_enable(evc->bev_remote, EV_READ);
-
-	fd = bufferevent_getfd(evc->bev_remote);
-	addrlen = sizeof(sa);
-	getsockname(fd, (struct sockaddr *)&sa, &addrlen);
-
-	memset(output, 0, sizeof(output));
-	output[0] = 0x05;
-	output[1] = 0x00;
-	output[2] = 0x00;
-	output[3] = 0x01;
-	output[4] = 0x00;
-	output[5] = 0x00;
-	output[6] = 0x00;
-	output[7] = 0x00;
-	output[8] = 0x10;
-	output[9] = 0x10;
-
-	bufferevent_write(evc->bev_local, output, 10);
-	bufferevent_enable(evc->bev_local, EV_WRITE);
 }
 
 //local server read callback
@@ -234,15 +213,11 @@ local_readcb(struct bufferevent *bev, void *user_data)
     struct bufferevent *partner = evc->bev_remote;
 	ev_ssize_t datalen = 0;
     unsigned short port = 0;
-    evutil_socket_t fd;
-    struct sockaddr_in sa;
-    socklen_t addrlen;
-    char output[16];
 	char *data = NULL;
    
 	datalen = evbuffer_get_length(input); 
 
-	data = (char *)calloc(1, datalen + 1);
+	data = (char *)calloc(datalen + 1, sizeof(char));
 	assert(data);
 
 	datalen = evbuffer_remove(input, data, datalen);
@@ -312,34 +287,15 @@ local_readcb(struct bufferevent *bev, void *user_data)
 				}
 				bufferevent_setcb(partner, remote_readcb, conn_writecb, conn_eventcb, (void *)evc);
 				bufferevent_enable(partner, EV_READ);
-
-				fd = bufferevent_getfd(partner);
-				addrlen = sizeof(sa);
-				getsockname(fd, (struct sockaddr *)&sa, &addrlen);
-
-				memset(output, 0, sizeof(output));
-				output[0] = 0x05;
-				output[1] = 0x00;
-				output[2] = 0x00;
-				output[3] = 0x01;
-				output[4] = 0x00;
-				output[5] = 0x00;
-				output[6] = 0x00;
-				output[7] = 0x00;
-				output[8] = 0x10;
-				output[9] = 0x10;
-
-				bufferevent_write(bev, output, 10);
-				bufferevent_enable(bev, EV_WRITE);
 			}
 		} else { //<stream
 			//<TODO decrypt
 			bufferevent_write(partner, data, datalen);
 			bufferevent_enable(partner, EV_WRITE);
 		}
-
-		free(data);
 	}while(0);
+
+	free(data);
 }
 
 static void
@@ -350,7 +306,7 @@ listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
 	struct timeval tv;
 	struct bufferevent *bev_in  = NULL;
 	struct bufferevent *bev_out = NULL;
-	struct ev_container *evc;
+	struct ev_container *evc = NULL;
 
 	vlog(DEBUG, "new client from %s:%d\n", 
 		inet_ntoa(((struct sockaddr_in *)sa)->sin_addr), ntohs(((struct sockaddr_in *)sa)->sin_port));
