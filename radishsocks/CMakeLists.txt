@@ -11,7 +11,7 @@ add_subdirectory(crypto)
 add_subdirectory(camouflage)
 
 add_executable(rsserver server.c log.c)
-target_link_libraries(rsserver rscrypto rscamouflage event)
+target_link_libraries(rsserver rscrypto rscamouflage event crypto)
 
 add_executable(rsclient client.c log.c)
-target_link_libraries(rsclient rscrypto rscamouflage event)
+target_link_libraries(rsclient rscrypto rscamouflage event crypto)

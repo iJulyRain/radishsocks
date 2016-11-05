@@ -39,19 +39,24 @@
 #include <event2/util.h>
 #include <event2/event.h>
 
+#include <openssl/aes.h>
+
 #include "log.h"
 
 static struct event_base *base;
 static char server_ip[16] = "";
-static char server_pwd[64] = "";
+static char server_pwd[128] = "";
 static int  server_port = 0;
+
+static AES_KEY dekey, enkey;
+static unsigned char iv[128]; 
 
 #define STAGE_INIT    0x00
 #define STAGE_VERSION 0x01
 #define STAGE_ADDR    0x02
 #define STAGE_STREAM  0x03
 
-#define BEV_TIMEOUT   10 //s
+#define BEV_TIMEOUT   30 //s
 
 struct ev_container{
 	struct bufferevent *bev_local, *bev_remote;
@@ -143,21 +148,29 @@ remote_readcb(struct bufferevent *bev, void *user_data)
 	struct evbuffer *input = bufferevent_get_input(bev);
 	struct ev_container *evc = user_data;
     struct bufferevent *partner = evc->bev_local;
-	ev_ssize_t datalen = 0;
+	ev_ssize_t datalen = 0, outdatalen = 0;
+    unsigned char *data = NULL, *outdata = NULL;
 
 	datalen = evbuffer_get_length(input); 
-
-	char data[datalen + 1];
+    data = (unsigned char *)calloc(datalen + 1, sizeof(unsigned char));
 	datalen = evbuffer_remove(input, data, datalen);
 
 	vlog(DEBUG, "REMOTE RECV(%d)\n", datalen);
-	vlog_array(INFO, data, datalen);
-
     reset_timer(evc->timeout_ev);
 
 	//TODO decrypt
-	bufferevent_write(partner, data, datalen);
+    outdatalen = (datalen / 16) * 16 + ((datalen % 16) > 0 ? 16 : 1);
+    outdata = (unsigned char *)calloc(outdatalen, sizeof(unsigned char));
+    strncpy((char *)iv, server_pwd, sizeof(iv) - 1);
+    AES_cbc_encrypt(data, outdata, datalen, &dekey, iv, AES_DECRYPT);
+
+	vlog_array(INFO, outdata, outdatalen);
+
+	bufferevent_write(partner, outdata, outdatalen);
 	bufferevent_enable(partner, EV_WRITE);
+
+    free(data);
+    free(outdata);
 }
 
 //local server read callback
@@ -167,12 +180,12 @@ local_readcb(struct bufferevent *bev, void *user_data)
 	struct evbuffer *input = bufferevent_get_input(bev);
 	struct ev_container *evc = user_data;
     struct bufferevent *partner = evc->bev_remote;
-	ev_ssize_t datalen = 0;
-	char *data = NULL;
-    char output[16];
+	ev_ssize_t datalen = 0, outdatalen = 0;
+	unsigned char *data = NULL, *outdata = NULL;
+    unsigned char output[16];
    
 	datalen = evbuffer_get_length(input); 
-	data = (char *)calloc(datalen + 1, sizeof(char));
+	data = (unsigned char *)calloc(datalen + 1, sizeof(unsigned char));
 	datalen = evbuffer_remove(input, data, datalen);
 
 	vlog(DEBUG, "LOCAL RECV(%d)\n", datalen);
@@ -249,9 +262,18 @@ local_readcb(struct bufferevent *bev, void *user_data)
 
 			//TODO encrypt
             data[0] = 0xFF;
-			bufferevent_write(partner, data, datalen);
+            
+            outdatalen = (datalen / 16) * 16 + ((datalen % 16) > 0 ? 16 : 1);
+            outdata = (unsigned char *)calloc(outdatalen, sizeof(unsigned char));
+            strncpy((char *)iv, server_pwd, sizeof(iv) - 1);
+            AES_cbc_encrypt(data, outdata, datalen, &enkey, iv, AES_ENCRYPT); 
+
+			bufferevent_write(partner, outdata, outdatalen);
 			bufferevent_enable(partner, EV_WRITE);
 
+            free(outdata);
+
+            //pong
 			memset(output, 0, sizeof(output));
 			output[0] = 0x05;
 			output[1] = 0x00;
@@ -273,8 +295,15 @@ local_readcb(struct bufferevent *bev, void *user_data)
 		case STAGE_STREAM:
 		{
 			//TODO encrypt
-			bufferevent_write(partner, data, datalen);
+            outdatalen = (datalen / 16) * 16 + ((datalen % 16) > 0 ? 16 : 1);
+            outdata = (unsigned char *)calloc(outdatalen, sizeof(unsigned char));
+            strncpy((char *)iv, server_pwd, sizeof(iv) - 1);
+            AES_cbc_encrypt(data, outdata, datalen, &enkey, iv, AES_ENCRYPT); 
+
+			bufferevent_write(partner, outdata, outdatalen);
 			bufferevent_enable(partner, EV_WRITE);
+
+            free(outdata);
 		}
 			break;
 	}
@@ -376,7 +405,6 @@ init(int argc, char **argv)
 
     loglevel = ERROR;
 
-    //TODO options
     while ((option = getopt(argc, argv, "v:s:p:b:l:k:")) > 0){
         switch (option) {
         case 'v':
@@ -435,6 +463,9 @@ init(int argc, char **argv)
 	    (struct sockaddr*)&saddr,
 	    sizeof(saddr));
     assert(listener);
+
+    AES_set_encrypt_key((unsigned char *)server_pwd, 128, &enkey);
+    AES_set_decrypt_key((unsigned char *)server_pwd, 128, &dekey);
 
     return 0;
 }

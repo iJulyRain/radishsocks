@@ -41,14 +41,19 @@
 #include <event2/dns.h>
 #include <event2/dns_struct.h>
 
+#include <openssl/aes.h>
+
 #include "log.h"
 
 static struct event_base *base;
 static struct evdns_base *evdns_base;
 
-static char server_pwd[64] = "";
+static char server_pwd[128] = "";
 
-#define BEV_TIMEOUT   10 //s
+static AES_KEY enkey, dekey;
+static unsigned char iv[128]; 
+
+#define BEV_TIMEOUT   30 //s
 
 struct ev_container{
 	struct bufferevent *bev_local, *bev_remote;
@@ -145,11 +150,11 @@ remote_readcb(struct bufferevent *bev, void *user_data)
 	struct evbuffer *input = bufferevent_get_input(bev);
 	struct ev_container *evc = user_data;
     struct bufferevent *partner = evc->bev_local;
-	ev_ssize_t datalen = 0;
-	char *data = NULL;
+	ev_ssize_t datalen = 0, outdatalen = 0;
+	unsigned char *data = NULL, *outdata = NULL;
 
 	datalen = evbuffer_get_length(input); 
-	data = (char *)calloc(datalen + 1, sizeof(char));
+	data = (unsigned char *)calloc(datalen + 1, sizeof(unsigned char));
 	assert(data);
 
 	datalen = evbuffer_remove(input, data, datalen);
@@ -160,10 +165,16 @@ remote_readcb(struct bufferevent *bev, void *user_data)
     reset_timer(evc->timeout_ev);
 
     //TODO encrypt
-    bufferevent_write(partner, data, datalen);
+    outdatalen = (datalen / 16) * 16 + ((datalen % 16) > 0 ? 16 : 1);
+    outdata = (unsigned char *)calloc(outdatalen, sizeof(unsigned char));
+    strncpy((char *)iv, server_pwd, sizeof(iv) - 1);
+    AES_cbc_encrypt(data, outdata, datalen, &enkey, iv, AES_ENCRYPT);
+
+    bufferevent_write(partner, outdata, outdatalen);
     bufferevent_enable(partner, EV_WRITE);
 
 	free(data);
+    free(outdata);
 }
 
 static void
@@ -211,26 +222,30 @@ local_readcb(struct bufferevent *bev, void *user_data)
 	struct evbuffer *input = bufferevent_get_input(bev);
 	struct ev_container *evc = user_data;
     struct bufferevent *partner = evc->bev_remote;
-	ev_ssize_t datalen = 0;
-    unsigned short port = 0;
-	char *data = NULL;
+	ev_ssize_t indatalen = 0, datalen = 0;
+    uint16_t port = 0;
+	unsigned char *data = NULL, *indata = NULL;
    
-	datalen = evbuffer_get_length(input); 
+	indatalen = evbuffer_get_length(input); 
 
-	data = (char *)calloc(datalen + 1, sizeof(char));
-	assert(data);
+	indata = (unsigned char *)calloc(indatalen + 1, sizeof(unsigned char));
+	assert(indata);
 
-	datalen = evbuffer_remove(input, data, datalen);
-	vlog(DEBUG, "LOCAL RECV(%d)\n", datalen);
-
-	vlog_array(INFO, data, datalen);
-
+	indatalen = evbuffer_remove(input, indata, indatalen);
     reset_timer(evc->timeout_ev);
+
+	//<TODO decrypt
+    datalen = (indatalen / 16) * 16 + ((indatalen % 16) > 0 ? 16 : 1);
+    data = (unsigned char *)calloc(datalen, sizeof(unsigned char));
+    strncpy((char *)iv, server_pwd, sizeof(iv) - 1);
+    AES_cbc_encrypt(indata, data, indatalen, &dekey, iv, AES_DECRYPT);
+
+	vlog(DEBUG, "LOCAL RECV(%d)\n", datalen);
+	vlog_array(INFO, data, datalen);
 
     ((struct sockaddr_in *)&evc->sa_remote)->sin_family = AF_INET;
 
 	do{
-		//<TODO decrypt
 		if ((unsigned char)data[0] == 0xFF) { //<addr
 			if (data[3] == 0x03){ //<domain
 				char domain[256];
@@ -267,10 +282,13 @@ local_readcb(struct bufferevent *bev, void *user_data)
 				((struct sockaddr_in *)&evc->sa_remote)->sin_port = htons(port);
 				memcpy(&((struct sockaddr_in *)&evc->sa_remote)->sin_addr.s_addr, data + 4, 4);
 
+                char remote_ip[32] = "", local_ip[32] = "";
+                strcpy(remote_ip, inet_ntoa(((struct sockaddr_in *)&evc->sa_remote)->sin_addr));
+                strcpy(local_ip, inet_ntoa(((struct sockaddr_in *)&evc->sa)->sin_addr));
 				vlog(DEBUG, "connection %s:%d from %s:%d\n",
-					inet_ntoa(((struct sockaddr_in *)&evc->sa_remote)->sin_addr),
+                    remote_ip,
 					port,
-					inet_ntoa(((struct sockaddr_in *)&evc->sa)->sin_addr),
+                    local_ip,
 					ntohs(((struct sockaddr_in *)&evc->sa)->sin_port)
 				);
 
@@ -289,13 +307,13 @@ local_readcb(struct bufferevent *bev, void *user_data)
 				bufferevent_enable(partner, EV_READ);
 			}
 		} else { //<stream
-			//<TODO decrypt
 			bufferevent_write(partner, data, datalen);
 			bufferevent_enable(partner, EV_WRITE);
 		}
 	}while(0);
 
 	free(data);
+    free(indata);
 }
 
 static void
@@ -430,6 +448,9 @@ init(int argc, char **argv)
 	    (struct sockaddr*)&saddr,
 	    sizeof(saddr));
     assert(listener);
+
+    AES_set_encrypt_key((unsigned char *)server_pwd, 128, &enkey);
+    AES_set_decrypt_key((unsigned char *)server_pwd, 128, &dekey);
 
     return 0;
 }
