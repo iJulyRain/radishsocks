@@ -1,12 +1,12 @@
 /*
  * =====================================================================================
  *
- *       Filename:  basic.c
+ *       Filename:  cipher.h
  *
- *    Description:  basic
+ *    Description:  cipher header
  *
  *        Version:  1.0
- *        Created:  10/27/2016 02:06:59 AM
+ *        Created:  11/06/2016 01:14:47 AM
  *       Revision:  none
  *       Compiler:  gcc
  *
@@ -16,4 +16,11 @@
  * =====================================================================================
  */
 
+#ifndef __CIPHER_H__
+#define __CIPHER_H__
 
+#include <stdlib.h>
+
+void rs_encrypt(const unsigned char *in, unsigned char *out, size_t len, const char *key);
+
+#endif

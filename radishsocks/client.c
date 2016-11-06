@@ -39,17 +39,13 @@
 #include <event2/util.h>
 #include <event2/event.h>
 
-#include <openssl/aes.h>
-
 #include "log.h"
+#include "cipher.h"
 
 static struct event_base *base;
 static char server_ip[16] = "";
 static char server_pwd[128] = "";
 static int  server_port = 0;
-
-static AES_KEY dekey, enkey;
-static unsigned char iv[128]; 
 
 #define STAGE_INIT    0x00
 #define STAGE_VERSION 0x01
@@ -92,8 +88,6 @@ reset_timer(struct event *timeout_ev)
 {
 	struct timeval tv;
 
-	vlog(INFO, "REST TIMER...\n");
-
     evtimer_del(timeout_ev);
 
 	evutil_timerclear(&tv);
@@ -106,8 +100,6 @@ timeout_cb(evutil_socket_t fd, short event, void *user_data)
 {
 	struct ev_container *evc = user_data;
 
-	vlog(ERROR, "TIMEOUT...\n");
-
 	free_ev_container(evc);
 }
 
@@ -117,7 +109,6 @@ conn_writecb(struct bufferevent *bev, void *user_data)
 	struct evbuffer *output = bufferevent_get_output(bev);
 
 	if (evbuffer_get_length(output) == 0) {
-		vlog(INFO, "flushed answer\n");
 	    bufferevent_disable(bev, EV_WRITE);
 	}
 }
@@ -128,7 +119,7 @@ conn_eventcb(struct bufferevent *bev, short events, void *user_data)
 	struct ev_container *evc = user_data;
 
 	if (events & BEV_EVENT_EOF) {
-		vlog(ERROR, "Connection closed.\n");
+		vlog(DEBUG, "Connection closed.\n");
 	} else if (events & BEV_EVENT_ERROR) {
 		vlog(ERROR, "Got an error on the connection: %s\n",
 		    strerror(errno));/*XXX win32*/
@@ -148,26 +139,56 @@ remote_readcb(struct bufferevent *bev, void *user_data)
 	struct evbuffer *input = bufferevent_get_input(bev);
 	struct ev_container *evc = user_data;
     struct bufferevent *partner = evc->bev_local;
-	ev_ssize_t datalen = 0, outdatalen = 0;
+	ev_ssize_t datalen = 0;
     unsigned char *data = NULL, *outdata = NULL;
+    unsigned char output[16];
 
 	datalen = evbuffer_get_length(input); 
-    data = (unsigned char *)calloc(datalen + 1, sizeof(unsigned char));
+    data = (unsigned char *)calloc(datalen, sizeof(unsigned char));
 	datalen = evbuffer_remove(input, data, datalen);
 
-	vlog(DEBUG, "REMOTE RECV(%d)\n", datalen);
+    //TODO decrypt
+    outdata = (unsigned char *)calloc(datalen, sizeof(unsigned char));
+    rs_encrypt(data, outdata, datalen, server_pwd);
+    //memcpy(outdata, data, datalen);
+
+	vlog(INFO, "REMOTE RECV(%d)\n", datalen);
+    vlog_array(INFO, outdata, datalen);
+
     reset_timer(evc->timeout_ev);
 
-	//TODO decrypt
-    outdatalen = (datalen / 16) * 16 + ((datalen % 16) > 0 ? 16 : 1);
-    outdata = (unsigned char *)calloc(outdatalen, sizeof(unsigned char));
-    strncpy((char *)iv, server_pwd, sizeof(iv) - 1);
-    AES_cbc_encrypt(data, outdata, datalen, &dekey, iv, AES_DECRYPT);
+    switch (evc->stage)
+    {
+        case STAGE_ADDR:
+        {
+            //pong
+			memset(output, 0, sizeof(output));
+			output[0] = 0x05;
+			output[1] = 0x00;
+			output[2] = 0x00;
+			output[3] = 0x01;
+			output[4] = 0x00;
+			output[5] = 0x00;
+			output[6] = 0x00;
+			output[7] = 0x00;
+			output[8] = 0x10;
+			output[9] = 0x10;
 
-	vlog_array(INFO, outdata, outdatalen);
+			bufferevent_write(partner, output, 10);
+			bufferevent_enable(partner, EV_WRITE);
 
-	bufferevent_write(partner, outdata, outdatalen);
-	bufferevent_enable(partner, EV_WRITE);
+            evc->stage = STAGE_STREAM;
+        }
+            break;
+
+        case STAGE_STREAM:
+        {
+            bufferevent_write(partner, outdata, datalen);
+            bufferevent_enable(partner, EV_WRITE);
+            
+        }
+            break;
+    }
 
     free(data);
     free(outdata);
@@ -180,15 +201,15 @@ local_readcb(struct bufferevent *bev, void *user_data)
 	struct evbuffer *input = bufferevent_get_input(bev);
 	struct ev_container *evc = user_data;
     struct bufferevent *partner = evc->bev_remote;
-	ev_ssize_t datalen = 0, outdatalen = 0;
+	ev_ssize_t datalen = 0;
 	unsigned char *data = NULL, *outdata = NULL;
     unsigned char output[16];
    
 	datalen = evbuffer_get_length(input); 
-	data = (unsigned char *)calloc(datalen + 1, sizeof(unsigned char));
+	data = (unsigned char *)calloc(datalen, sizeof(unsigned char));
 	datalen = evbuffer_remove(input, data, datalen);
 
-	vlog(DEBUG, "LOCAL RECV(%d)\n", datalen);
+	vlog(INFO, "LOCAL RECV(%d)\n", datalen);
 	vlog_array(INFO, data, datalen);
 
     reset_timer(evc->timeout_ev);
@@ -262,45 +283,26 @@ local_readcb(struct bufferevent *bev, void *user_data)
 
 			//TODO encrypt
             data[0] = 0xFF;
-            
-            outdatalen = (datalen / 16) * 16 + ((datalen % 16) > 0 ? 16 : 1);
-            outdata = (unsigned char *)calloc(outdatalen, sizeof(unsigned char));
-            strncpy((char *)iv, server_pwd, sizeof(iv) - 1);
-            AES_cbc_encrypt(data, outdata, datalen, &enkey, iv, AES_ENCRYPT); 
+            outdata = (unsigned char *)calloc(datalen, sizeof(unsigned char));
+            rs_encrypt(data, outdata, datalen, server_pwd);
+            //memcpy(outdata, data, datalen);
 
-			bufferevent_write(partner, outdata, outdatalen);
+			bufferevent_write(partner, outdata, datalen);
 			bufferevent_enable(partner, EV_WRITE);
 
             free(outdata);
 
-            //pong
-			memset(output, 0, sizeof(output));
-			output[0] = 0x05;
-			output[1] = 0x00;
-			output[2] = 0x00;
-			output[3] = 0x01;
-			output[4] = 0x00;
-			output[5] = 0x00;
-			output[6] = 0x00;
-			output[7] = 0x00;
-			output[8] = 0x10;
-			output[9] = 0x10;
-
-			bufferevent_write(bev, output, 10);
-			bufferevent_enable(bev, EV_WRITE);
-
-			evc->stage = STAGE_STREAM;
+			evc->stage = STAGE_ADDR;
 		}
 			break;
 		case STAGE_STREAM:
 		{
 			//TODO encrypt
-            outdatalen = (datalen / 16) * 16 + ((datalen % 16) > 0 ? 16 : 1);
-            outdata = (unsigned char *)calloc(outdatalen, sizeof(unsigned char));
-            strncpy((char *)iv, server_pwd, sizeof(iv) - 1);
-            AES_cbc_encrypt(data, outdata, datalen, &enkey, iv, AES_ENCRYPT); 
+            outdata = (unsigned char *)calloc(datalen, sizeof(unsigned char));
+            rs_encrypt(data, outdata, datalen, server_pwd);
+            //memcpy(outdata, data, datalen);
 
-			bufferevent_write(partner, outdata, outdatalen);
+			bufferevent_write(partner, outdata, datalen);
 			bufferevent_enable(partner, EV_WRITE);
 
             free(outdata);
@@ -433,14 +435,20 @@ init(int argc, char **argv)
         }
     }
 
-    if (server_ip[0] == '\0' || server_pwd[0] == '\0'){
+    if (server_pwd[0] == '\0'){
         usage();
         return -1; 
     }
+
+    if (server_ip[0] == '\0')
+        strcpy(server_ip, "127.0.0.1");
+
     if (server_port == 0)
         server_port = 8575;
+
     if (bind_port == 0)
         bind_port = 1080;
+
     if (bind_ip[0] == '\0')
         strcpy(bind_ip, "0.0.0.0");
 
@@ -463,9 +471,6 @@ init(int argc, char **argv)
 	    (struct sockaddr*)&saddr,
 	    sizeof(saddr));
     assert(listener);
-
-    AES_set_encrypt_key((unsigned char *)server_pwd, 128, &enkey);
-    AES_set_decrypt_key((unsigned char *)server_pwd, 128, &dekey);
 
     return 0;
 }
