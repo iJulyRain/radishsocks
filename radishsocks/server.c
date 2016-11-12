@@ -284,16 +284,15 @@ local_readcb(struct bufferevent *bev, void *user_data)
 					ntohs(((struct sockaddr_in *)&evc->sa)->sin_port)
 				);
 				strncpy(evc->domain, domain, strlen(domain));
+				((struct sockaddr_in *)&evc->sa_remote)->sin_port = htons(port);
+
                 memset(&hints, 0, sizeof(hints));
                 hints.ai_family = AF_UNSPEC;
                 hints.ai_flags = EVUTIL_AI_CANONNAME;
                 dns_req = evdns_getaddrinfo(evdns_base, domain, NULL, &hints, dns_cb, (void *)evc);
 
                 evc->dns_req = dns_req;
-
 				//evdns_base_resolve_ipv4(evdns_base, domain, 0, dns_cb, (void *)evc);
-
-				((struct sockaddr_in *)&evc->sa_remote)->sin_port = htons(port);
 			} else if (outdata[3] == 0x01) { //<ip
 				if (datalen < 10){
 					free_ev_container(evc);
