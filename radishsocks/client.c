@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
 
 #include <getopt.h>
 
@@ -28,6 +29,7 @@
 
 #include "log.h"
 #include "cipher.h"
+#include "base.h"
 
 #define NAME "client"
 
@@ -41,7 +43,7 @@
 #define IP_ADDRESS_MAX   32
 #define SERVER_PWD_MAX  32 
 
-#define SERVER_INFO_MAX 16
+#define SERVER_INFO_MAX 16  //max server
 #define LOCAL_INFO_MAX  64  //max listener
 
 struct server_info{ //server
@@ -57,7 +59,10 @@ struct local_info{
 };
 
 struct config_info{
+	int server_info_count;
     struct server_info server_info[SERVER_INFO_MAX];
+
+	int local_info_count;
     struct local_info local_info[LOCAL_INFO_MAX];
 
     struct server_info manager_info;
@@ -69,7 +74,7 @@ struct ev_container{
 
 	int stage;
 
-    struct rs_object_base *rs_obj;
+	struct server_info *server_info;
 };
 
 static void
@@ -130,9 +135,9 @@ conn_eventcb(struct bufferevent *bev, short events, void *user_data)
 	struct ev_container *evc = user_data;
 
 	if (events & BEV_EVENT_EOF) {
-		vlog(DEBUG, "Connection closed.\n");
+		vlog(INFO, "Connection closed.\n");
 	} else if (events & BEV_EVENT_ERROR) {
-		vlog(ERROR, "Got an error on the connection: %s\n",
+		vlog(INFO, "Got an error on the connection: %s\n",
 		    strerror(errno));/*XXX win32*/
 	} else if (events & BEV_EVENT_CONNECTED) {
         return;
@@ -160,8 +165,7 @@ remote_readcb(struct bufferevent *bev, void *user_data)
 
     //TODO decrypt
     outdata = (unsigned char *)calloc(datalen, sizeof(unsigned char));
-    rs_encrypt(data, outdata, datalen, server_pwd);
-    //memcpy(outdata, data, datalen);
+    rs_decrypt(data, outdata, datalen, evc->server_info->server_pwd);
 
 	vlog(INFO, "REMOTE RECV(%d)\n", datalen);
     vlog_array(INFO, outdata, datalen);
@@ -295,8 +299,7 @@ local_readcb(struct bufferevent *bev, void *user_data)
 			//TODO encrypt
             data[0] = 0xFF;
             outdata = (unsigned char *)calloc(datalen, sizeof(unsigned char));
-            rs_encrypt(data, outdata, datalen, server_pwd);
-            //memcpy(outdata, data, datalen);
+            rs_encrypt(data, outdata, datalen, evc->server_info->server_pwd);
 
 			bufferevent_write(partner, outdata, datalen);
 			bufferevent_enable(partner, EV_WRITE);
@@ -310,8 +313,7 @@ local_readcb(struct bufferevent *bev, void *user_data)
 		{
 			//TODO encrypt
             outdata = (unsigned char *)calloc(datalen, sizeof(unsigned char));
-            rs_encrypt(data, outdata, datalen, server_pwd);
-            //memcpy(outdata, data, datalen);
+            rs_encrypt(data, outdata, datalen, evc->server_info->server_pwd);
 
 			bufferevent_write(partner, outdata, datalen);
 			bufferevent_enable(partner, EV_WRITE);
@@ -328,16 +330,27 @@ static void
 listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
     struct sockaddr *sa, int socklen, void *user_data)
 {
-    int rc;
+    int server_i, rc;
 	struct event *timeout;
 	struct timeval tv;
 	struct bufferevent *bev_in  = NULL;
 	struct bufferevent *bev_out = NULL;
     struct sockaddr_in saddr;
 	struct ev_container *evc;
+    struct rs_object_base *rs_obj; 
+	struct config_info *config_info;
+	struct event_base *base;
+	
+	rs_obj = (struct rs_object_base *)user_data;
+	config_info = (struct config_info *)rs_obj->user_data;
 
-	vlog(DEBUG, "new client from %s:%d\n", 
-		inet_ntoa(((struct sockaddr_in *)sa)->sin_addr), ntohs(((struct sockaddr_in *)sa)->sin_port));
+	base = rs_obj->base;
+
+	server_i = rand() % config_info->server_info_count;
+
+	vlog(DEBUG, "new client from %s:%d ==> using tunnel: %s:%d\n", 
+		inet_ntoa(((struct sockaddr_in *)sa)->sin_addr), ntohs(((struct sockaddr_in *)sa)->sin_port),
+		config_info->server_info[server_i].server_ip, config_info->server_info[server_i].server_port);
 
 	bev_in = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
 	if (!bev_in) {
@@ -360,6 +373,7 @@ listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
 	evc->bev_local = bev_in;
 	evc->bev_remote = bev_out;
 	evc->stage = STAGE_INIT;
+	evc->server_info = config_info->server_info + server_i;
 
 	bufferevent_setcb(bev_in, local_readcb, conn_writecb, conn_eventcb, (void *)evc);
 	bufferevent_enable(bev_in, EV_READ);
@@ -368,8 +382,8 @@ listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
 	//<connect to server
     memset(&saddr, 0, sizeof(struct sockaddr_in));
     saddr.sin_family = AF_INET;
-    saddr.sin_port = htons(server_port);
-    saddr.sin_addr.s_addr = inet_addr(server_ip);
+    saddr.sin_port = htons(config_info->server_info[server_i].server_port);
+    saddr.sin_addr.s_addr = inet_addr(config_info->server_info[server_i].server_ip);
 
 	rc = bufferevent_socket_connect(
 		bev_out,
@@ -397,8 +411,7 @@ static void
 usage()
 {
     vlog(ERROR, 
-        "Usage: rssocks -t 0 [-v 0/1/2] -s x.x.x.x [-p 8575] [-b 127.0.0.1] [-l 1080] [-m xx.xx.xx.xx] -k password\n"
-        "\t-v <verbose>: 0 DEFAULT/1 DEBUG/2 INFO\n"
+        "Usage: rssocks -t 0 [-v 0/1/2] -s x.x.x.x -p 8575 -b 127.0.0.1 -l 1080 [-m xx.xx.xx.xx] -k password\n"
         "\t-s <serverIP>: rsserver address\n"
         "\t-p <serverPort>: rsserver listen port\n"
         "\t-b <localAddress>: local bind address\n"
@@ -414,6 +427,8 @@ create_listener(const char *ip, const int port, void *self)
 	struct evconnlistener *listener;
 	struct sockaddr_in saddr;
     struct rs_object_base *rs_obj = (struct rs_object_base *)self;
+
+    vlog(DEBUG, "listen %s:%d\n", ip, port);
 
     memset(&saddr, 0, sizeof(struct sockaddr_in));
     saddr.sin_family = AF_INET;
@@ -434,67 +449,86 @@ create_listener(const char *ip, const int port, void *self)
 }
 
 static int 
-init(int argc, char **argv, void *self)
+client_init(int argc, char **argv, void *self)
 {
+	int i;
     int option;
+    struct rs_object_base *rs_obj; 
+	struct config_info *config_info;
+	
+	rs_obj = (struct rs_object_base *)self;
 
-    loglevel = ERROR;
+	config_info = (struct config_info *)calloc(1, sizeof(struct config_info));
+	assert(config_info);
 
-    while ((option = getopt(argc, argv, "v:s:p:b:l:k:")) > 0){
+    while ((option = getopt(argc, argv, "s:p:b:l:k:m:")) > 0){
         switch (option) {
         case 's':
-            memset(server_ip, 0, sizeof(server_ip));
-            strncpy(server_ip, optarg, sizeof(server_ip) - 1);
+			config_info->server_info_count++;
+            strncpy(config_info->server_info[config_info->server_info_count - 1].server_ip, optarg, IP_ADDRESS_MAX - 1);
             break;
         case 'p':
-            server_port = atoi(optarg);
+            config_info->server_info[config_info->server_info_count - 1].server_port = atoi(optarg);
             break;
         case 'b':
-            memset(bind_ip, 0, sizeof(bind_ip));
-            strncpy(bind_ip, optarg, sizeof(bind_ip) - 1);
+			config_info->local_info_count++;
+            strncpy(config_info->local_info[config_info->local_info_count - 1].local_ip, optarg, IP_ADDRESS_MAX - 1);
             break;
         case 'l':
-            bind_port = atoi(optarg);
+            config_info->local_info[config_info->local_info_count - 1].local_port = atoi(optarg);
             break;
         case 'k':
-            memset(server_pwd, 0, sizeof(server_pwd));
-            strncpy(server_pwd, optarg, sizeof(server_pwd) - 1);
+            strncpy(config_info->server_info[config_info->server_info_count - 1].server_pwd, optarg, SERVER_PWD_MAX - 1);
+            break;
+		case 'm':
+            strncpy(config_info->manager_info.server_ip, optarg, IP_ADDRESS_MAX - 1);
+			config_info->manager_info.server_port = 9600;
             break;
         default:
-            break;
+			usage();
+			return -1;
         }
     }
 
-    if (server_pwd[0] == '\0'){
-        usage();
-        return -1; 
-    }
+    rs_obj->base = event_base_new();
+    assert(rs_obj->base);
 
-    if (server_ip[0] == '\0')
-        strcpy(server_ip, "127.0.0.1");
+	rs_obj->user_data = config_info;
 
-    if (server_port == 0)
-        server_port = 8575;
+	//create listener 
+	for (i = 0; i < config_info->local_info_count; i++)
+	{
+		config_info->local_info[i].listener = create_listener(
+			config_info->local_info[i].local_ip,
+			config_info->local_info[i].local_port,
+			self
+		);
+	}
 
-    if (bind_port == 0)
-        bind_port = 1080;
-
-    if (bind_ip[0] == '\0')
-        strcpy(bind_ip, "0.0.0.0");
-
-    vlog(DEBUG, "listen %s:%d\n", bind_ip, bind_port);
-
-    base = event_base_new();
-    assert(base);
+	srand(time(NULL));
 
     return 0;
 }
 
 static void client_destroy(void *self)
 {
-    struct rs_object_base *rs_obj = (struct rs_object_base *)self;
+	int i;
+    struct rs_object_base *rs_obj; 
+	struct config_info *config_info;
+	
+	rs_obj = (struct rs_object_base *)self;
+	config_info = (struct config_info *)rs_obj->user_data;
 
     event_base_free(rs_obj->base);
+
+	//free listener
+	for (i = 0; i < LOCAL_INFO_MAX; i++)
+	{
+		if (!config_info->local_info[i].listener)
+			continue;
+
+		evconnlistener_free(config_info->local_info[i].listener);
+	}
 }
 
 static struct rs_object_base rs_obj = {

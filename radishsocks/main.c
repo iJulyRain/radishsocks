@@ -19,6 +19,8 @@
 #include "base.h"
 #include "log.h"
 
+#include "client.h"
+
 #include <stdlib.h>
 #include <getopt.h>
 
@@ -36,14 +38,23 @@ static void usage(void)
     );
 }
 
+static void register_modules(void)
+{
+	register_rs_object_client();
+}
+
 int main(int argc, char **argv)
 {
     int rc = 0;
     int option;
     struct rs_object_base *rs_obj = NULL;
 
-    loglevel = ERROR;
+    loglevel = DEBUG;
 
+	container_init();
+	register_modules();
+
+	/*
     while((option = getopt(argc, argv, "t:v:")) > 0)
     {
         switch (option)
@@ -59,7 +70,7 @@ int main(int argc, char **argv)
 
                 rs_obj = new_rs_object(typename[index], index);
             }
-            break;
+            	break;
 
             case 'v':
             {
@@ -70,10 +81,14 @@ int main(int argc, char **argv)
                     return -1;
                 }
             }
-            break;
+            	break;
+			default:
+				break;
         }
     }
+	*/
 
+    rs_obj = new_rs_object(typename[0], 0);
     if (!rs_obj)
     {
         usage();
