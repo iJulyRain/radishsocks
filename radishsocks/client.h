@@ -1,12 +1,12 @@
 /*
  * =====================================================================================
  *
- *       Filename:  cipher.h
+ *       Filename:  client.h
  *
- *    Description:  cipher header
+ *    Description:  client header
  *
  *        Version:  1.0
- *        Created:  11/06/2016 01:14:47 AM
+ *        Created:  11/16/2016 03:59:22 PM
  *       Revision:  none
  *       Compiler:  gcc
  *
@@ -15,14 +15,9 @@
  *
  * =====================================================================================
  */
+#ifndef __RS_CLIENT_H__
+#define __RS_CLIENT_H__
 
-#ifndef __CIPHER_H__
-#define __CIPHER_H__
-
-#include <stdlib.h>
-
-#define rs_decrypt rs_encrypt
-
-void rs_encrypt(const unsigned char *in, unsigned char *out, size_t len, const char *key);
+void register_rs_object_client(void);
 
 #endif

@@ -1,5 +1,4 @@
-add_executable(rsserver server.c log.c cipher.c)
-target_link_libraries(rsserver event)
+AUX_SOURCE_DIRECTORY(. SRC)
 
-add_executable(rsclient client.c log.c cipher.c)
-target_link_libraries(rsclient event)
+add_executable(rssocks ${SRC})
+target_link_libraries(rssocks event)

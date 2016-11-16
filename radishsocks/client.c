@@ -3,10 +3,10 @@
  *
  *       Filename:  client.c
  *
- *    Description:  client for radishsocks
+ *    Description:  client
  *
  *        Version:  1.0
- *        Created:  10/27/2016 01:08:51 AM
+ *        Created:  11/16/2016 03:56:49 PM
  *       Revision:  none
  *       Compiler:  gcc
  *
@@ -20,32 +20,16 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <signal.h>
 #include <errno.h>
 
 #include <getopt.h>
-#include <libgen.h>
 
 #include <assert.h>
-
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-
-#include <event2/bufferevent.h>
-#include <event2/buffer.h>
-#include <event2/listener.h>
-#include <event2/util.h>
-#include <event2/event.h>
 
 #include "log.h"
 #include "cipher.h"
 
-static struct event_base *base;
-static char server_ip[16] = "";
-static char server_pwd[128] = "";
-static int  server_port = 0;
+#define NAME "client"
 
 #define STAGE_INIT    0x00
 #define STAGE_VERSION 0x01
@@ -54,11 +38,38 @@ static int  server_port = 0;
 
 #define BEV_TIMEOUT   30 //s
 
+#define IP_ADDRESS_MAX   32
+#define SERVER_PWD_MAX  32 
+
+#define SERVER_INFO_MAX 16
+#define LOCAL_INFO_MAX  64  //max listener
+
+struct server_info{ //server
+    char server_ip[IP_ADDRESS_MAX];
+    char server_pwd[SERVER_PWD_MAX];
+    int  server_port;
+};
+
+struct local_info{
+    char local_ip[IP_ADDRESS_MAX];
+    int  local_port;
+    struct evconnlistener *listener;
+};
+
+struct config_info{
+    struct server_info server_info[SERVER_INFO_MAX];
+    struct local_info local_info[LOCAL_INFO_MAX];
+
+    struct server_info manager_info;
+};
+
 struct ev_container{
 	struct bufferevent *bev_local, *bev_remote;
     struct event *timeout_ev;
 
 	int stage;
+
+    struct rs_object_base *rs_obj;
 };
 
 static void
@@ -386,32 +397,51 @@ static void
 usage()
 {
     vlog(ERROR, 
-        "Usage: \n"
+        "Usage: rssocks -t 0 [-v 0/1/2] -s x.x.x.x [-p 8575] [-b 127.0.0.1] [-l 1080] [-m xx.xx.xx.xx] -k password\n"
         "\t-v <verbose>: 0 DEFAULT/1 DEBUG/2 INFO\n"
         "\t-s <serverIP>: rsserver address\n"
         "\t-p <serverPort>: rsserver listen port\n"
         "\t-b <localAddress>: local bind address\n"
         "\t-l <localPort>: local bind port\n"
+        "\t-m <manager>: manager address\n"
         "\t-k <password>: password\n"
     );
 }
 
-static int 
-init(int argc, char **argv)
+static struct evconnlistener *
+create_listener(const char *ip, const int port, void *self)
 {
 	struct evconnlistener *listener;
 	struct sockaddr_in saddr;
+    struct rs_object_base *rs_obj = (struct rs_object_base *)self;
+
+    memset(&saddr, 0, sizeof(struct sockaddr_in));
+    saddr.sin_family = AF_INET;
+    saddr.sin_port = htons(port);
+    saddr.sin_addr.s_addr = inet_addr(ip);
+
+    listener = evconnlistener_new_bind(
+        rs_obj->base,
+        listener_cb,
+        self,
+	    LEV_OPT_REUSEABLE | LEV_OPT_CLOSE_ON_FREE, 
+        -1,
+	    (struct sockaddr*)&saddr,
+	    sizeof(saddr));
+    assert(listener);
+
+    return listener;
+}
+
+static int 
+init(int argc, char **argv, void *self)
+{
     int option;
-    char bind_ip[16] = "";
-    int bind_port = 0;
 
     loglevel = ERROR;
 
     while ((option = getopt(argc, argv, "v:s:p:b:l:k:")) > 0){
         switch (option) {
-        case 'v':
-	        loglevel = atoi(optarg);
-            break;
         case 's':
             memset(server_ip, 0, sizeof(server_ip));
             strncpy(server_ip, optarg, sizeof(server_ip) - 1);
@@ -457,43 +487,22 @@ init(int argc, char **argv)
     base = event_base_new();
     assert(base);
 
-    memset(&saddr, 0, sizeof(struct sockaddr_in));
-    saddr.sin_family = AF_INET;
-    saddr.sin_port = htons(bind_port);
-    saddr.sin_addr.s_addr = inet_addr(bind_ip);
-
-    listener = evconnlistener_new_bind(
-        base,
-        listener_cb,
-        (void *)0,
-	    LEV_OPT_REUSEABLE | LEV_OPT_CLOSE_ON_FREE, 
-        -1,
-	    (struct sockaddr*)&saddr,
-	    sizeof(saddr));
-    assert(listener);
-
     return 0;
 }
 
-void 
-run(void)
+static void client_destroy(void *self)
 {
-    event_base_dispatch(base);
+    struct rs_object_base *rs_obj = (struct rs_object_base *)self;
+
+    event_base_free(rs_obj->base);
 }
 
-int 
-main(int argc, char **argv)
+static struct rs_object_base rs_obj = {
+    .init    = client_init,
+    .destroy = client_destroy
+}; 
+
+void register_rs_object_client(void)
 {
-    int rc;
-
-    rc = init(argc, argv);
-    if (rc != 0) {
-        vlog(ERROR, "initial error!\n");
-        return -1;
-    }
-
-    run();
-    //won't be here
-
-    return 0;
+	object_addend(&rs_obj.parent, NAME, rs_obj_type_client);
 }
