@@ -20,32 +20,17 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <signal.h>
 #include <errno.h>
 
 #include <getopt.h>
-#include <libgen.h>
 
 #include <assert.h>
 
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-
-#include <event2/bufferevent.h>
-#include <event2/buffer.h>
-#include <event2/listener.h>
-#include <event2/util.h>
-#include <event2/event.h>
-#include <event2/dns.h>
-#include <event2/dns_struct.h>
-
-#include <openssl/aes.h>
-
 #include "log.h"
 #include "cipher.h"
+#include "base.h"
+
+#define NAME "rs-server"
 
 static struct event_base *base;
 static struct evdns_base *evdns_base;
@@ -250,7 +235,7 @@ local_readcb(struct bufferevent *bev, void *user_data)
 
 	//<TODO decrypt
     outdata = (unsigned char *)calloc(datalen, sizeof(unsigned char));
-    rs_encrypt(data, outdata, datalen, server_pwd);
+    rs_decrypt(data, outdata, datalen, server_pwd);
     //memcpy(outdata, data, datalen);
 
 	vlog(INFO, "LOCAL RECV(%d)\n", datalen);
@@ -402,7 +387,7 @@ usage()
 }
 
 static int 
-init(int argc, char **argv)
+server_init(int argc, char **argv)
 {
     int rc;
 	struct evconnlistener *listener;
@@ -478,25 +463,18 @@ init(int argc, char **argv)
     return 0;
 }
 
-void 
-run(void)
+static void 
+server_destroy(void *self)
 {
-    event_base_dispatch(base);
+
 }
 
-int 
-main(int argc, char **argv)
+static struct rs_object_base rs_obj = {
+    .init    = server_init,
+    .destroy = server_destroy
+}; 
+
+void register_rs_object_server(void)
 {
-    int rc;
-
-    rc = init(argc, argv);
-    if (rc != 0) {
-        vlog(ERROR, "initial error!\n");
-        return -1;
-    }
-
-    run();
-    //won't be here
-
-    return 0;
+	object_addend(&rs_obj.parent, NAME, rs_obj_type_server);
 }

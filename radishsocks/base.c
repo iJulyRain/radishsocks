@@ -60,5 +60,7 @@ void delete_rs_object(struct rs_object_base *rs_object_base)
     rs_object_base->init    = NULL;
     rs_object_base->destroy = NULL;
 
+    free(rs_object_base);
+
     return;
 }

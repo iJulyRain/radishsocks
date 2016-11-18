@@ -31,14 +31,17 @@
 #include "cipher.h"
 #include "base.h"
 
-#define NAME "client"
+#include "common.h"
+
+#define NAME "rs-client"
 
 #define STAGE_INIT    0x00
 #define STAGE_VERSION 0x01
-#define STAGE_ADDR    0x02
-#define STAGE_STREAM  0x03
+#define STAGE_AUTH    0x02
+#define STAGE_ADDR    0x03
+#define STAGE_STREAM  0x04
 
-#define BEV_TIMEOUT   30 //s
+#define BEV_TIMEOUT 30
 
 #define IP_ADDRESS_MAX   32
 #define SERVER_PWD_MAX  32 
@@ -52,7 +55,7 @@ struct server_info{ //server
     int  server_port;
 };
 
-struct local_info{
+struct local_info{ //local
     char local_ip[IP_ADDRESS_MAX];
     int  local_port;
     struct evconnlistener *listener;
@@ -60,24 +63,33 @@ struct local_info{
 
 struct config_info{
 	int server_info_count;
-    struct server_info server_info[SERVER_INFO_MAX];
+    struct server_info server_info[SERVER_INFO_MAX]; //muti server
 
 	int local_info_count;
-    struct local_info local_info[LOCAL_INFO_MAX];
+    struct local_info local_info[LOCAL_INFO_MAX]; //muti local
 
-    struct server_info manager_info;
+    struct server_info manager_info; //single manager
 };
 
 struct ev_container{
 	struct bufferevent *bev_local, *bev_remote;
     struct event *timeout_ev;
+    struct sockaddr sa;
 
 	int stage;
 
-	struct server_info *server_info;
+	struct server_info *server_info; //event server info
 };
 
-static void
+static int
+verify_auth(const char *username, const char *password)
+{
+    vlog(INFO, "username: %s, password: %s\n", username, password);
+
+    return 0;
+}
+
+static void 
 free_ev_container(struct ev_container *evc)
 {
 	if (evc->bev_local){
@@ -97,18 +109,6 @@ free_ev_container(struct ev_container *evc)
 	}
 
 	free(evc);
-}
-
-static void 
-reset_timer(struct event *timeout_ev)
-{
-	struct timeval tv;
-
-    evtimer_del(timeout_ev);
-
-	evutil_timerclear(&tv);
-	tv.tv_sec = BEV_TIMEOUT;
-	evtimer_add(timeout_ev, &tv);
 }
 
 static void
@@ -170,7 +170,7 @@ remote_readcb(struct bufferevent *bev, void *user_data)
 	vlog(INFO, "REMOTE RECV(%d)\n", datalen);
     vlog_array(INFO, outdata, datalen);
 
-    reset_timer(evc->timeout_ev);
+    reset_timer(evc->timeout_ev, BEV_TIMEOUT);
 
     switch (evc->stage)
     {
@@ -178,16 +178,9 @@ remote_readcb(struct bufferevent *bev, void *user_data)
         {
             //pong
 			memset(output, 0, sizeof(output));
-			output[0] = 0x05;
-			output[1] = 0x00;
-			output[2] = 0x00;
-			output[3] = 0x01;
-			output[4] = 0x00;
-			output[5] = 0x00;
-			output[6] = 0x00;
-			output[7] = 0x00;
-			output[8] = 0x10;
-			output[9] = 0x10;
+			output[0] = 0x05; output[1] = 0x00; output[2] = 0x00; output[3] = 0x01;
+			output[4] = 0x00; output[5] = 0x00; output[6] = 0x00; output[7] = 0x00;
+			output[8] = 0x10; output[9] = 0x10;
 
 			bufferevent_write(partner, output, 10);
 			bufferevent_enable(partner, EV_WRITE);
@@ -200,7 +193,6 @@ remote_readcb(struct bufferevent *bev, void *user_data)
         {
             bufferevent_write(partner, outdata, datalen);
             bufferevent_enable(partner, EV_WRITE);
-            
         }
             break;
     }
@@ -216,6 +208,7 @@ local_readcb(struct bufferevent *bev, void *user_data)
 	struct evbuffer *input = bufferevent_get_input(bev);
 	struct ev_container *evc = user_data;
     struct bufferevent *partner = evc->bev_remote;
+    struct domain_info domain_info;
 	ev_ssize_t datalen = 0;
 	unsigned char *data = NULL, *outdata = NULL;
     unsigned char output[16];
@@ -227,7 +220,7 @@ local_readcb(struct bufferevent *bev, void *user_data)
 	vlog(INFO, "LOCAL RECV(%d)\n", datalen);
 	vlog_array(INFO, data, datalen);
 
-    reset_timer(evc->timeout_ev);
+    reset_timer(evc->timeout_ev, BEV_TIMEOUT);
 
 	switch (evc->stage)
 	{
@@ -265,21 +258,76 @@ local_readcb(struct bufferevent *bev, void *user_data)
 			}
 
 			output[0] = 0x05;
-			if (noauth)
-				output[1] = 0x00;
-			else if (pwdauth)
+			if (pwdauth){
 				output[1] = 0x02;
+			    evc->stage = STAGE_AUTH;
+            }else if (noauth){
+				output[1] = 0x00;
+			    evc->stage = STAGE_VERSION;
+            }
             else{
 				vlog(ERROR, "Socks5 METHODS need 0,2\n");
 				free_ev_container(evc);
+                break;
             }
+
+			bufferevent_write(bev, output, 2);
+			bufferevent_enable(bev, EV_WRITE);
+		}
+			break;
+        case STAGE_AUTH:
+        {
+            int rc = 0;
+            int username_size = 0, password_size = 0;
+            char username[64] = "", password[64] = "";
+
+            if (data[0] != 0x01){
+                vlog(ERROR, "Bad header: %#02X\n", data[0]);
+				free_ev_container(evc);
+                break;
+            }
+            if (datalen < 5){
+                vlog(ERROR, "Bad length: %d\n", datalen);
+				free_ev_container(evc);
+                break;
+            }
+
+            username_size = data[1];
+
+            if (datalen < username_size + 4){
+                vlog(ERROR, "Bad length: %d\n", datalen);
+				free_ev_container(evc);
+                break;
+            }
+
+            password_size = data[2 + username_size];
+
+            if (datalen < username_size + password_size + 3){
+                vlog(ERROR, "Bad length: %d\n", datalen);
+				free_ev_container(evc);
+                break;
+            }
+
+            memcpy(username, data + 2, username_size);
+            memcpy(password, data + 2 + username_size + 1, password_size);
+
+            //TODO verify auth
+            rc = verify_auth(username, password);
+            if (rc != 0){
+                vlog(ERROR, "Bad auth: %s, %s\n", username, password);
+				free_ev_container(evc);
+                break;
+            }
+
+			memset(output, 0, sizeof(output));
+			output[0] = 0x01; output[1] = 0x00; 
 
 			bufferevent_write(bev, output, 2);
 			bufferevent_enable(bev, EV_WRITE);
 
 			evc->stage = STAGE_VERSION;
-		}
-			break;
+        }
+            break;
 		case STAGE_VERSION:
 		{
 			if (data[0] != 0x05){
@@ -295,6 +343,16 @@ local_readcb(struct bufferevent *bev, void *user_data)
 
                 break;
             }
+
+            memset(&domain_info, 0, sizeof(struct domain_info));
+
+            parse_header(data, datalen, &domain_info);
+            vlog(DEBUG, "==> <%s:%d> connect to <%s:%d>\n", 
+                inet_ntoa(((struct sockaddr_in *)&evc->sa)->sin_addr),
+                ntohs(((struct sockaddr_in *)&evc->sa)->sin_port),
+                domain_info.address,
+                domain_info.port
+            );
 
 			//TODO encrypt
             data[0] = 0xFF;
@@ -352,6 +410,7 @@ listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
 		inet_ntoa(((struct sockaddr_in *)sa)->sin_addr), ntohs(((struct sockaddr_in *)sa)->sin_port),
 		config_info->server_info[server_i].server_ip, config_info->server_info[server_i].server_port);
 
+    //build bufferevent
 	bev_in = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
 	if (!bev_in) {
 		vlog(ERROR, "Error constructing bufferevent (input)!");
@@ -366,10 +425,11 @@ listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
 		return;
 	}
 
-	///<local
+	///<build ev container
 	evc = (struct ev_container *)calloc(1, sizeof(struct ev_container));
 	assert(evc);
 
+    evc->sa = *sa;
 	evc->bev_local = bev_in;
 	evc->bev_remote = bev_out;
 	evc->stage = STAGE_INIT;
@@ -411,7 +471,8 @@ static void
 usage()
 {
     vlog(ERROR, 
-        "Usage: rssocks -t 0 [-v 0/1/2] -s x.x.x.x -p 8575 -b 127.0.0.1 -l 1080 [-m xx.xx.xx.xx] -k password\n"
+        "Usage: rssocks [-v 0/1/2] -s x.x.x.x [-p 9600] [-b 127.0.0.1 -l 1080] [-m xx.xx.xx.xx] -k password\n"
+        "\t-v <verbose>: 0 default/ 1 debug/ 2 info\n"
         "\t-s <serverIP>: rsserver address\n"
         "\t-p <serverPort>: rsserver listen port\n"
         "\t-b <localAddress>: local bind address\n"
@@ -443,7 +504,6 @@ create_listener(const char *ip, const int port, void *self)
         -1,
 	    (struct sockaddr*)&saddr,
 	    sizeof(saddr));
-    assert(listener);
 
     return listener;
 }
@@ -461,33 +521,76 @@ client_init(int argc, char **argv, void *self)
 	config_info = (struct config_info *)calloc(1, sizeof(struct config_info));
 	assert(config_info);
 
-    while ((option = getopt(argc, argv, "s:p:b:l:k:m:")) > 0){
+    loglevel = ERROR;
+
+    while ((option = getopt(argc, argv, "v:s:p:b:l:k:m:")) > 0){
         switch (option) {
+        case 'v':
+            loglevel = atoi(optarg);
+            if (loglevel > INFO){
+                usage();
+                return -1;
+            }
+            break;
         case 's':
 			config_info->server_info_count++;
-            strncpy(config_info->server_info[config_info->server_info_count - 1].server_ip, optarg, IP_ADDRESS_MAX - 1);
+            strncpy(
+                config_info->server_info[config_info->server_info_count - 1].server_ip, 
+                optarg, 
+                IP_ADDRESS_MAX - 1);
+            config_info->server_info[config_info->server_info_count - 1].server_port = 9600; //default server port
             break;
         case 'p':
             config_info->server_info[config_info->server_info_count - 1].server_port = atoi(optarg);
             break;
         case 'b':
 			config_info->local_info_count++;
-            strncpy(config_info->local_info[config_info->local_info_count - 1].local_ip, optarg, IP_ADDRESS_MAX - 1);
+            strncpy(
+                config_info->local_info[config_info->local_info_count - 1].local_ip, 
+                optarg, 
+                IP_ADDRESS_MAX - 1);
             break;
         case 'l':
             config_info->local_info[config_info->local_info_count - 1].local_port = atoi(optarg);
             break;
         case 'k':
-            strncpy(config_info->server_info[config_info->server_info_count - 1].server_pwd, optarg, SERVER_PWD_MAX - 1);
+            strncpy(
+                config_info->server_info[config_info->server_info_count - 1].server_pwd, 
+                optarg, 
+                SERVER_PWD_MAX - 1);
             break;
 		case 'm':
-            strncpy(config_info->manager_info.server_ip, optarg, IP_ADDRESS_MAX - 1);
-			config_info->manager_info.server_port = 9600;
+            strncpy(
+                config_info->manager_info.server_ip, 
+                optarg, 
+                IP_ADDRESS_MAX - 1);
+			config_info->manager_info.server_port = 12800; //default manager port
             break;
         default:
 			usage();
 			return -1;
         }
+    }
+
+    //check config
+    if (config_info->server_info_count == 0){
+        usage();
+        return -1;
+    }
+
+    for (i = 0; i < config_info->server_info_count; i++){
+        if (config_info->server_info[i].server_pwd[0] == '\0'){
+            usage();
+            return -1;
+        }
+    }
+
+    //default listen address 127.0.0.1:1080
+    if (config_info->local_info_count == 0){
+        config_info->local_info_count ++;
+
+        strncpy(config_info->local_info[0].local_ip, "127.0.0.1", IP_ADDRESS_MAX - 1);
+        config_info->local_info[0].local_port = 1080;
     }
 
     rs_obj->base = event_base_new();
@@ -503,6 +606,7 @@ client_init(int argc, char **argv, void *self)
 			config_info->local_info[i].local_port,
 			self
 		);
+        assert(config_info->local_info[i].listener);
 	}
 
 	srand(time(NULL));
@@ -510,7 +614,8 @@ client_init(int argc, char **argv, void *self)
     return 0;
 }
 
-static void client_destroy(void *self)
+static void 
+client_destroy(void *self)
 {
 	int i;
     struct rs_object_base *rs_obj; 
@@ -529,6 +634,8 @@ static void client_destroy(void *self)
 
 		evconnlistener_free(config_info->local_info[i].listener);
 	}
+
+    free(config_info);
 }
 
 static struct rs_object_base rs_obj = {

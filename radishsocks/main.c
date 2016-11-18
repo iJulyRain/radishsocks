@@ -24,81 +24,53 @@
 #include <stdlib.h>
 #include <getopt.h>
 
-const char *typename[] = {
-    "client",  //0
-    "server"   //1
+#include <libgen.h>
+
+const char *appname_arr[] = {
+    "rs-client",  //0
+    "rs-server"   //1
 };
 
-static void usage(void)
+static void init(void)
 {
-    vlog(ERROR, 
-        "Usage: ./rssocks -t typeid [-v 0/1/2] ...\n"
-        "\t-t <typeid>: 0 client/1 server"
-        "\t-v <verbose>: 0 DEFAULT/1 DEBUG/2 INFO\n"
-    );
-}
-
-static void register_modules(void)
-{
+	container_init();
 	register_rs_object_client();
 }
 
 int main(int argc, char **argv)
 {
-    int rc = 0;
-    int option;
+    int type, gotit, rc = 0;
+    const char *appname = NULL;
     struct rs_object_base *rs_obj = NULL;
 
-    loglevel = DEBUG;
+    init();
 
-	container_init();
-	register_modules();
+    appname = basename(argv[0]);
 
-	/*
-    while((option = getopt(argc, argv, "t:v:")) > 0)
-    {
-        switch (option)
-        {
-            case 't':
-            {
-                int index = atoi(optarg);
-                if (index >= (sizeof(typename) / sizeof(const char *)))
-                {
-                    usage();
-                    return -1;
-                }
+    gotit = 0;
+    for (type = 0; type < (sizeof(appname_arr) / sizeof(const char *)); type++){
+        if (strcmp(appname, appname_arr[type]))
+            continue;
 
-                rs_obj = new_rs_object(typename[index], index);
-            }
-            	break;
-
-            case 'v':
-            {
-	            loglevel = atoi(optarg);
-                if (loglevel > INFO)
-                {
-                    usage();
-                    return -1;
-                }
-            }
-            	break;
-			default:
-				break;
-        }
+        gotit = 1;
+        break;
     }
-	*/
 
-    rs_obj = new_rs_object(typename[0], 0);
-    if (!rs_obj)
-    {
-        usage();
+    if (!gotit){
+        vlog(ERROR, "unknown appname: <%s>\n", appname);
+        vlog(ERROR, "try: rs-server or  rs-client\n");
+        return -1;
+    }
+
+    rs_obj = new_rs_object(appname, type);
+    if (!rs_obj){
+        vlog(ERROR, "appname <%s> will support soon..\n");
         return -1;
     }
 
     rc = rs_obj->init(argc, argv, rs_obj);
-    if (rc != 0)
-    {
-        vlog(ERROR, "<%s> initial falied!\n");
+    if (rc != 0){
+        vlog(ERROR, "<%s> initial falied!\n", appname);
         return -1;
     }
 
