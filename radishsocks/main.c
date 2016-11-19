@@ -20,6 +20,7 @@
 #include "log.h"
 
 #include "client.h"
+#include "server.h"
 
 #include <stdlib.h>
 #include <getopt.h>
@@ -28,13 +29,15 @@
 
 const char *appname_arr[] = {
     "rs-client",  //0
-    "rs-server"   //1
+    "rs-server",  //1
+	"rs-manage",  //2
 };
 
 static void init(void)
 {
 	container_init();
 	register_rs_object_client();
+	register_rs_object_server();
 }
 
 int main(int argc, char **argv)

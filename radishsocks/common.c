@@ -65,3 +65,29 @@ int parse_header(const unsigned char *data, const int datalen, struct domain_inf
 
     return 0;
 }
+
+struct evconnlistener *create_listener(const char *ip, const int port, 
+	void (*listener_cb)(struct evconnlistener *, evutil_socket_t, struct sockaddr *, int, void *), void *self)
+{
+	struct evconnlistener *listener;
+	struct sockaddr_in saddr;
+    struct rs_object_base *rs_obj = (struct rs_object_base *)self;
+
+    vlog(DEBUG, "listen %s:%d\n", ip, port);
+
+    memset(&saddr, 0, sizeof(struct sockaddr_in));
+    saddr.sin_family = AF_INET;
+    saddr.sin_port = htons(port);
+    saddr.sin_addr.s_addr = inet_addr(ip);
+
+    listener = evconnlistener_new_bind(
+        rs_obj->base,
+        listener_cb,
+        self,
+	    LEV_OPT_REUSEABLE | LEV_OPT_CLOSE_ON_FREE, 
+        -1,
+	    (struct sockaddr*)&saddr,
+	    sizeof(saddr));
+
+    return listener;
+}

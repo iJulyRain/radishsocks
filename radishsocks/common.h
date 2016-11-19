@@ -22,6 +22,11 @@
 
 #define ADDRESS_MAX 256 
 
+#define BEV_TIMEOUT 30
+
+#define IP_ADDRESS_MAX   32
+#define PASSWORD_MAX  32 
+
 enum{
     type_ip = 0,
     type_domain
@@ -35,5 +40,7 @@ struct domain_info{
 
 void reset_timer(struct event *timeout_ev, int timeout);
 int parse_header(const unsigned char *data, const int datalen, struct domain_info *domain_info);
+struct evconnlistener *create_listener(const char *ip, const int port, 
+void (*listener_cb)(struct evconnlistener *, evutil_socket_t, struct sockaddr *, int, void *), void *self);
 
 #endif

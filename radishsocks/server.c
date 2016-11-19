@@ -26,25 +26,47 @@
 
 #include <assert.h>
 
+#include <event2/dns.h>
+#include <event2/dns_struct.h>
+
 #include "log.h"
 #include "cipher.h"
 #include "base.h"
 
+#include "common.h"
+
 #define NAME "rs-server"
 
-static struct event_base *base;
-static struct evdns_base *evdns_base;
+struct local_info{ //local
+    char local_ip[IP_ADDRESS_MAX];
+    char local_pwd[PASSWORD_MAX];
+    int  local_port;
 
-static char server_pwd[128] = "";
+    struct evconnlistener *listener;
+};
 
-#define BEV_TIMEOUT   30 //s
+struct server_info{ //server
+    char server_ip[IP_ADDRESS_MAX];
+    char server_pwd[PASSWORD_MAX];
+    int  server_port;
+};
+
+struct config_info{
+    struct local_info local_info;
+	struct evdns_base *evdns_base;
+
+    struct server_info manager_info;
+};
 
 struct ev_container{
 	struct bufferevent *bev_local, *bev_remote;
     struct event *timeout_ev;
     struct sockaddr sa, sa_remote;
     struct evdns_getaddrinfo_request *dns_req;
-	char domain[256];
+	struct domain_info domain_info;
+
+	struct local_info *local_info;
+	struct evdns_base *evdns_base;
 };
 
 static void
@@ -74,21 +96,6 @@ free_ev_container(struct ev_container *evc)
 	free(evc);
 }
 
-static void 
-reset_timer(struct event *timeout_ev)
-{
-	struct timeval tv;
-
-	if (!timeout_ev)
-		return;
-
-    evtimer_del(timeout_ev);
-
-	evutil_timerclear(&tv);
-	tv.tv_sec = BEV_TIMEOUT;
-	evtimer_add(timeout_ev, &tv);
-}
-
 static void
 timeout_cb(evutil_socket_t fd, short event, void *user_data)
 {
@@ -113,10 +120,10 @@ conn_eventcb(struct bufferevent *bev, short events, void *user_data)
 	struct ev_container *evc = user_data;
 
 	if (events & BEV_EVENT_EOF) {
-		vlog(DEBUG, "(%s) Connection closed.\n", evc->domain);
+		vlog(DEBUG, "(%s) Connection closed.\n", evc->domain_info.address);
 	} else if (events & BEV_EVENT_ERROR) {
 		vlog(ERROR, "(%s) Got an error on the connection: %s\n",
-            evc->domain,
+            evc->domain_info.address,
 		    strerror(errno));/*XXX win32*/
 	} else if (events & BEV_EVENT_CONNECTED) {
         return;
@@ -145,12 +152,11 @@ remote_readcb(struct bufferevent *bev, void *user_data)
 	vlog(INFO, "REMOTE RECV(%d)\n", datalen);
 
 	vlog_array(INFO, data, datalen);
-
-    reset_timer(evc->timeout_ev);
+    reset_timer(evc->timeout_ev, BEV_TIMEOUT);
 
     //TODO encrypt
     outdata = (unsigned char *)calloc(datalen, sizeof(unsigned char));
-    rs_encrypt(data, outdata, datalen, server_pwd);
+    rs_encrypt(data, outdata, datalen, evc->local_info->local_pwd);
     //memcpy(outdata, data, datalen);
 
     bufferevent_write(partner, outdata, datalen);
@@ -172,7 +178,6 @@ dns_cb(int errcode, struct evutil_addrinfo *addr, void *ptr)
 
     if (errcode){
         vlog(ERROR, "-> %s\n", evutil_gai_strerror(errcode));
-        //free_ev_container(evc);
         return;
     }
 
@@ -184,13 +189,13 @@ dns_cb(int errcode, struct evutil_addrinfo *addr, void *ptr)
     }
 
     if (address == 0){
-        vlog(ERROR, "(%s) -> not answer\n", evc->domain);
+        vlog(ERROR, "(%s) -> not answer\n", evc->domain_info.address);
         free_ev_container(evc);
         return;
     }
 
 	((struct sockaddr_in *)&evc->sa_remote)->sin_addr.s_addr = address;
-    vlog(INFO, "dns resolve -> %s(%s)\n", evc->domain, inet_ntoa(((struct sockaddr_in *)&evc->sa_remote)->sin_addr));
+    vlog(INFO, "dns resolve -> %s(%s)\n", evc->domain_info.address, inet_ntoa(((struct sockaddr_in *)&evc->sa_remote)->sin_addr));
 
 	rc = bufferevent_socket_connect(
 		evc->bev_remote,
@@ -222,7 +227,6 @@ local_readcb(struct bufferevent *bev, void *user_data)
 	struct ev_container *evc = user_data;
     struct bufferevent *partner = evc->bev_remote;
 	ev_ssize_t datalen = 0;
-    uint16_t port = 0;
 	unsigned char *data = NULL, *outdata = NULL;
    
 	datalen = evbuffer_get_length(input); 
@@ -231,72 +235,36 @@ local_readcb(struct bufferevent *bev, void *user_data)
 	assert(data);
 
 	datalen = evbuffer_remove(input, data, datalen);
-    reset_timer(evc->timeout_ev);
+    reset_timer(evc->timeout_ev, BEV_TIMEOUT);
 
 	//<TODO decrypt
     outdata = (unsigned char *)calloc(datalen, sizeof(unsigned char));
-    rs_decrypt(data, outdata, datalen, server_pwd);
-    //memcpy(outdata, data, datalen);
+    rs_decrypt(data, outdata, datalen, evc->local_info->local_pwd);
 
 	vlog(INFO, "LOCAL RECV(%d)\n", datalen);
 	vlog_array(INFO, outdata, datalen);
 
-    ((struct sockaddr_in *)&evc->sa_remote)->sin_family = AF_INET;
-
 	do{
 		if ((unsigned char)outdata[0] == 0xFF) { //<addr
-			if (outdata[3] == 0x03){ //<domain
-				char domain[256];
-				size_t domain_size;
-                struct evutil_addrinfo hints;
-                struct evdns_getaddrinfo_request *dns_req;
+			rc = parse_header(outdata, datalen, &evc->domain_info);
+			if (rc != 0){
+				vlog(ERROR, "bad package!\n");
+				free_ev_container(evc);
+				break;
+			}
 
-				domain_size = outdata[4];
-				if (datalen < (7 + domain_size)){
-					free_ev_container(evc);
-					break;
-				}
-					
-				memset(domain, 0, sizeof(domain));
-				memcpy(domain, outdata + 5, domain_size);
+			vlog(DEBUG, "==> <%s:%d> connect to <%s:%d>\n", 
+				inet_ntoa(((struct sockaddr_in *)&evc->sa)->sin_addr),
+				ntohs(((struct sockaddr_in *)&evc->sa)->sin_port),
+				evc->domain_info.address,
+				evc->domain_info.port
+			);
 
-				port = outdata[5 + domain_size + 0] << 8 | outdata[5 + domain_size + 1] << 0;
+    		((struct sockaddr_in *)&evc->sa_remote)->sin_family = AF_INET;
+			((struct sockaddr_in *)&evc->sa_remote)->sin_port = htons(evc->domain_info.port);
 
-				vlog(DEBUG, "connection %s:%d from %s:%d\n",
-					domain,
-					port,
-					inet_ntoa(((struct sockaddr_in *)&evc->sa)->sin_addr),
-					ntohs(((struct sockaddr_in *)&evc->sa)->sin_port)
-				);
-				strncpy(evc->domain, domain, strlen(domain));
-				((struct sockaddr_in *)&evc->sa_remote)->sin_port = htons(port);
-
-                memset(&hints, 0, sizeof(hints));
-                hints.ai_family = AF_UNSPEC;
-                hints.ai_flags = EVUTIL_AI_CANONNAME;
-                dns_req = evdns_getaddrinfo(evdns_base, domain, NULL, &hints, dns_cb, (void *)evc);
-
-                evc->dns_req = dns_req;
-				//evdns_base_resolve_ipv4(evdns_base, domain, 0, dns_cb, (void *)evc);
-			} else if (outdata[3] == 0x01) { //<ip
-				if (datalen < 10){
-					free_ev_container(evc);
-					break;
-				}
-
-				port = outdata[8] << 8 | outdata[9] << 0;
-				((struct sockaddr_in *)&evc->sa_remote)->sin_port = htons(port);
-				memcpy(&((struct sockaddr_in *)&evc->sa_remote)->sin_addr.s_addr, outdata + 4, 4);
-
-                char remote_ip[32] = "", local_ip[32] = "";
-                strcpy(remote_ip, inet_ntoa(((struct sockaddr_in *)&evc->sa_remote)->sin_addr));
-                strcpy(local_ip, inet_ntoa(((struct sockaddr_in *)&evc->sa)->sin_addr));
-				vlog(DEBUG, "connection %s:%d from %s:%d\n",
-                    remote_ip,
-					port,
-                    local_ip,
-					ntohs(((struct sockaddr_in *)&evc->sa)->sin_port)
-				);
+			if (evc->domain_info.type == type_ip){
+				((struct sockaddr_in *)&evc->sa_remote)->sin_addr.s_addr = inet_addr(evc->domain_info.address);
 
 				rc = bufferevent_socket_connect(
 					partner,
@@ -313,13 +281,20 @@ local_readcb(struct bufferevent *bev, void *user_data)
 				bufferevent_enable(partner, EV_READ);
 
                 //pong
-                bufferevent_write(bev, outdata, datalen);
+				char output[1] = {0x01};
+                bufferevent_write(bev, output, 1);
                 bufferevent_enable(bev, EV_WRITE);
+			}else if(evc->domain_info.type == type_domain){
+				struct evutil_addrinfo hints;
+
+				memset(&hints, 0, sizeof(hints));
+				hints.ai_family = AF_UNSPEC;
+				hints.ai_flags = EVUTIL_AI_CANONNAME;
+				evc->dns_req = evdns_getaddrinfo(evc->evdns_base, evc->domain_info.address, NULL, &hints, dns_cb, (void *)evc);
 			}
 		} else { //<stream
 			bufferevent_write(partner, outdata, datalen);
-            if (bufferevent_getfd(partner) != -1)
-			    bufferevent_enable(partner, EV_WRITE);
+			bufferevent_enable(partner, EV_WRITE);
 		}
 	}while(0);
 
@@ -331,11 +306,19 @@ static void
 listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
     struct sockaddr *sa, int socklen, void *user_data)
 {
-	struct event *timeout;
+	struct event *timeout = NULL;
 	struct timeval tv;
 	struct bufferevent *bev_in  = NULL;
 	struct bufferevent *bev_out = NULL;
 	struct ev_container *evc = NULL;
+    struct rs_object_base *rs_obj = NULL; 
+	struct config_info *config_info = NULL;
+	struct event_base *base = NULL;
+
+	rs_obj = (struct rs_object_base *)user_data;
+	config_info = (struct config_info *)rs_obj->user_data;
+
+	base = rs_obj->base;
 
 	vlog(DEBUG, "new client from %s:%d\n", 
 		inet_ntoa(((struct sockaddr_in *)sa)->sin_addr), ntohs(((struct sockaddr_in *)sa)->sin_port));
@@ -358,9 +341,11 @@ listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
 	evc = (struct ev_container *)calloc(1, sizeof(struct ev_container));
 	assert(evc);
 
+    evc->sa = *sa;
 	evc->bev_local = bev_in;
 	evc->bev_remote = bev_out;
-    evc->sa = *sa;
+	evc->local_info = &config_info->local_info;
+	evc->evdns_base = config_info->evdns_base;
 
 	///<local
 	bufferevent_setcb(bev_in, local_readcb, conn_writecb, conn_eventcb, (void *)evc);
@@ -387,14 +372,17 @@ usage()
 }
 
 static int 
-server_init(int argc, char **argv)
+server_init(int argc, char **argv, void *self)
 {
     int rc;
-	struct evconnlistener *listener;
-	struct sockaddr_in saddr;
     int option;
-    char bind_ip[16] = "";
-    int bind_port = 0;
+    struct rs_object_base *rs_obj; 
+	struct config_info *config_info;
+
+	rs_obj = (struct rs_object_base *)self;
+
+	config_info = (struct config_info *)calloc(1, sizeof(struct config_info));
+	assert(config_info);
 
     loglevel = ERROR;
 
@@ -403,62 +391,60 @@ server_init(int argc, char **argv)
         switch (option) {
         case 'v':
 	        loglevel = atoi(optarg);
+            if (loglevel > INFO){
+                usage();
+                return -1;
+            }
             break;
         case 'b':
-            memset(bind_ip, 0, sizeof(bind_ip));
-            strncpy(bind_ip, optarg, sizeof(bind_ip) - 1);
+            strncpy(config_info->local_info.local_ip, optarg, IP_ADDRESS_MAX - 1);
             break;
         case 'l':
-            bind_port = atoi(optarg);
+			config_info->local_info.local_port = atoi(optarg);
             break;
         case 'k':
-            memset(server_pwd, 0, sizeof(server_pwd));
-            strncpy(server_pwd, optarg, sizeof(server_pwd) - 1);
+            strncpy(config_info->local_info.local_pwd, optarg, PASSWORD_MAX - 1);
             break;
         default:
-            break;
+        	usage();
+			return -1;
         }
     }
 
-    if (server_pwd[0] == '\0'){
+    if (config_info->local_info.local_pwd[0] == '\0'){
         usage();
         return -1; 
     }
 
-    if (bind_port == 0)
-        bind_port = 8575;
-    if (bind_ip[0] == '\0')
-        strcpy(bind_ip, "127.0.0.1");
+    if (config_info->local_info.local_port == 0)
+        config_info->local_info.local_port = 9600;
+    if (config_info->local_info.local_ip[0] == '\0')
+        strcpy(config_info->local_info.local_ip, "127.0.0.1");
+	
+	//new event base
+    rs_obj->base = event_base_new();
+    assert(rs_obj->base);
 
-    vlog(DEBUG, "listen %s:%d\n", bind_ip, bind_port);
+	//new event dns base
+    config_info->evdns_base = evdns_base_new(rs_obj->base, 0);
+    assert(config_info->evdns_base);
 
-    base = event_base_new();
-    assert(base);
+	rs_obj->user_data = config_info;
 
-    evdns_base = evdns_base_new(base, 0);
-    assert(evdns_base);
-
-    rc = evdns_base_nameserver_ip_add(evdns_base, "8.8.4.4");
-	//rc = evdns_base_resolv_conf_parse(evdns_base, DNS_OPTION_NAMESERVERS, "/etc/resolv.conf");
+    //rc = evdns_base_nameserver_ip_add(evdns_base, "8.8.4.4");
+	rc = evdns_base_resolv_conf_parse(config_info->evdns_base, DNS_OPTION_NAMESERVERS, "/etc/resolv.conf");
     if (rc < 0){
         vlog(ERROR, "Couldn't configure nameserver");
         return -2;
     }
 
-    memset(&saddr, 0, sizeof(struct sockaddr_in));
-    saddr.sin_family = AF_INET;
-    saddr.sin_port = htons(bind_port);
-    saddr.sin_addr.s_addr = inet_addr(bind_ip);
-
-    listener = evconnlistener_new_bind(
-        base,
-        listener_cb,
-        (void *)0,
-	    LEV_OPT_REUSEABLE | LEV_OPT_CLOSE_ON_FREE, 
-        -1,
-	    (struct sockaddr*)&saddr,
-	    sizeof(saddr));
-    assert(listener);
+	config_info->local_info.listener = create_listener(
+			config_info->local_info.local_ip,
+			config_info->local_info.local_port,
+			listener_cb,
+			self
+		);
+	assert(config_info->local_info.listener);
 
     return 0;
 }
@@ -466,7 +452,18 @@ server_init(int argc, char **argv)
 static void 
 server_destroy(void *self)
 {
+    struct rs_object_base *rs_obj; 
+	struct config_info *config_info;
 
+	rs_obj = (struct rs_object_base *)self;
+	config_info = (struct config_info *)rs_obj->user_data;
+
+	event_base_dispatch(rs_obj->base);
+	evconnlistener_free(config_info->local_info.listener);
+
+	evdns_base_free(config_info->evdns_base, 0);
+
+    event_base_free(rs_obj->base);
 }
 
 static struct rs_object_base rs_obj = {

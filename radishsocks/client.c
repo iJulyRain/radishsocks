@@ -41,17 +41,12 @@
 #define STAGE_ADDR    0x03
 #define STAGE_STREAM  0x04
 
-#define BEV_TIMEOUT 30
-
-#define IP_ADDRESS_MAX   32
-#define SERVER_PWD_MAX  32 
-
 #define SERVER_INFO_MAX 16  //max server
 #define LOCAL_INFO_MAX  64  //max listener
 
 struct server_info{ //server
     char server_ip[IP_ADDRESS_MAX];
-    char server_pwd[SERVER_PWD_MAX];
+    char server_pwd[PASSWORD_MAX];
     int  server_port;
 };
 
@@ -389,15 +384,15 @@ listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
     struct sockaddr *sa, int socklen, void *user_data)
 {
     int server_i, rc;
-	struct event *timeout;
+	struct event *timeout = NULL;
 	struct timeval tv;
 	struct bufferevent *bev_in  = NULL;
 	struct bufferevent *bev_out = NULL;
     struct sockaddr_in saddr;
-	struct ev_container *evc;
-    struct rs_object_base *rs_obj; 
-	struct config_info *config_info;
-	struct event_base *base;
+	struct ev_container *evc = NULL;
+    struct rs_object_base *rs_obj = NULL;
+	struct config_info *config_info = NULL;
+	struct event_base *base = NULL;
 	
 	rs_obj = (struct rs_object_base *)user_data;
 	config_info = (struct config_info *)rs_obj->user_data;
@@ -482,32 +477,6 @@ usage()
     );
 }
 
-static struct evconnlistener *
-create_listener(const char *ip, const int port, void *self)
-{
-	struct evconnlistener *listener;
-	struct sockaddr_in saddr;
-    struct rs_object_base *rs_obj = (struct rs_object_base *)self;
-
-    vlog(DEBUG, "listen %s:%d\n", ip, port);
-
-    memset(&saddr, 0, sizeof(struct sockaddr_in));
-    saddr.sin_family = AF_INET;
-    saddr.sin_port = htons(port);
-    saddr.sin_addr.s_addr = inet_addr(ip);
-
-    listener = evconnlistener_new_bind(
-        rs_obj->base,
-        listener_cb,
-        self,
-	    LEV_OPT_REUSEABLE | LEV_OPT_CLOSE_ON_FREE, 
-        -1,
-	    (struct sockaddr*)&saddr,
-	    sizeof(saddr));
-
-    return listener;
-}
-
 static int 
 client_init(int argc, char **argv, void *self)
 {
@@ -557,7 +526,7 @@ client_init(int argc, char **argv, void *self)
             strncpy(
                 config_info->server_info[config_info->server_info_count - 1].server_pwd, 
                 optarg, 
-                SERVER_PWD_MAX - 1);
+                PASSWORD_MAX - 1);
             break;
 		case 'm':
             strncpy(
@@ -604,6 +573,7 @@ client_init(int argc, char **argv, void *self)
 		config_info->local_info[i].listener = create_listener(
 			config_info->local_info[i].local_ip,
 			config_info->local_info[i].local_port,
+			listener_cb,
 			self
 		);
         assert(config_info->local_info[i].listener);
@@ -624,7 +594,7 @@ client_destroy(void *self)
 	rs_obj = (struct rs_object_base *)self;
 	config_info = (struct config_info *)rs_obj->user_data;
 
-    event_base_free(rs_obj->base);
+	event_base_dispatch(rs_obj->base);
 
 	//free listener
 	for (i = 0; i < LOCAL_INFO_MAX; i++)
@@ -634,6 +604,8 @@ client_destroy(void *self)
 
 		evconnlistener_free(config_info->local_info[i].listener);
 	}
+
+    event_base_free(rs_obj->base);
 
     free(config_info);
 }
