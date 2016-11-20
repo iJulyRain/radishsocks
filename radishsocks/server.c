@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
+#include <signal.h>
 
 #include <getopt.h>
 
@@ -94,6 +95,17 @@ free_ev_container(struct ev_container *evc)
     }
 
 	free(evc);
+}
+
+static void
+signal_cb(evutil_socket_t fd, short event, void *user_data)
+{
+    struct rs_object_base *rs_obj; 
+
+    vlog(ERROR, "==>got signal SIGPIPE!\n");
+	
+	rs_obj = (struct rs_object_base *)user_data;
+    rs_obj->destroy(rs_obj);
 }
 
 static void
@@ -378,6 +390,7 @@ server_init(int argc, char **argv, void *self)
     int option;
     struct rs_object_base *rs_obj; 
 	struct config_info *config_info;
+    struct event *signal_event;
 
 	rs_obj = (struct rs_object_base *)self;
 
@@ -445,6 +458,11 @@ server_init(int argc, char **argv, void *self)
 			self
 		);
 	assert(config_info->local_info.listener);
+
+    //signal event
+    signal_event = evsignal_new(rs_obj->base, SIGPIPE, signal_cb, self);
+    assert(signal_event);
+    evsignal_add(signal_event, NULL);
 
     return 0;
 }

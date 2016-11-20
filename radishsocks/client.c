@@ -22,6 +22,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
+#include <signal.h>
 
 #include <getopt.h>
 
@@ -103,7 +104,18 @@ free_ev_container(struct ev_container *evc)
 		evc->timeout_ev = NULL;
 	}
 
-	free(evc);
+	FREE(evc);
+}
+
+static void
+signal_cb(evutil_socket_t fd, short event, void *user_data)
+{
+    struct rs_object_base *rs_obj; 
+
+    vlog(ERROR, "==>got signal SIGPIPE!\n");
+	
+	rs_obj = (struct rs_object_base *)user_data;
+    rs_obj->destroy(rs_obj);
 }
 
 static void
@@ -155,11 +167,11 @@ remote_readcb(struct bufferevent *bev, void *user_data)
     unsigned char output[16];
 
 	datalen = evbuffer_get_length(input); 
-    data = (unsigned char *)calloc(datalen, sizeof(unsigned char));
+    data = (unsigned char *)CALLOC(datalen, sizeof(unsigned char));
 	datalen = evbuffer_remove(input, data, datalen);
 
     //TODO decrypt
-    outdata = (unsigned char *)calloc(datalen, sizeof(unsigned char));
+    outdata = (unsigned char *)CALLOC(datalen, sizeof(unsigned char));
     rs_decrypt(data, outdata, datalen, evc->server_info->server_pwd);
 
 	vlog(INFO, "REMOTE RECV(%d)\n", datalen);
@@ -192,8 +204,8 @@ remote_readcb(struct bufferevent *bev, void *user_data)
             break;
     }
 
-    free(data);
-    free(outdata);
+    FREE(data);
+    FREE(outdata);
 }
 
 //local server read callback
@@ -209,7 +221,7 @@ local_readcb(struct bufferevent *bev, void *user_data)
     unsigned char output[16];
    
 	datalen = evbuffer_get_length(input); 
-	data = (unsigned char *)calloc(datalen, sizeof(unsigned char));
+	data = (unsigned char *)CALLOC(datalen, sizeof(unsigned char));
 	datalen = evbuffer_remove(input, data, datalen);
 
 	vlog(INFO, "LOCAL RECV(%d)\n", datalen);
@@ -351,13 +363,13 @@ local_readcb(struct bufferevent *bev, void *user_data)
 
 			//TODO encrypt
             data[0] = 0xFF;
-            outdata = (unsigned char *)calloc(datalen, sizeof(unsigned char));
+            outdata = (unsigned char *)CALLOC(datalen, sizeof(unsigned char));
             rs_encrypt(data, outdata, datalen, evc->server_info->server_pwd);
 
 			bufferevent_write(partner, outdata, datalen);
 			bufferevent_enable(partner, EV_WRITE);
 
-            free(outdata);
+            FREE(outdata);
 
 			evc->stage = STAGE_ADDR;
 		}
@@ -365,18 +377,18 @@ local_readcb(struct bufferevent *bev, void *user_data)
 		case STAGE_STREAM:
 		{
 			//TODO encrypt
-            outdata = (unsigned char *)calloc(datalen, sizeof(unsigned char));
+            outdata = (unsigned char *)CALLOC(datalen, sizeof(unsigned char));
             rs_encrypt(data, outdata, datalen, evc->server_info->server_pwd);
 
 			bufferevent_write(partner, outdata, datalen);
 			bufferevent_enable(partner, EV_WRITE);
 
-            free(outdata);
+            FREE(outdata);
 		}
 			break;
 	}
 
-	free(data);
+	FREE(data);
 }
 
 static void
@@ -421,7 +433,7 @@ listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
 	}
 
 	///<build ev container
-	evc = (struct ev_container *)calloc(1, sizeof(struct ev_container));
+	evc = (struct ev_container *)CALLOC(1, sizeof(struct ev_container));
 	assert(evc);
 
     evc->sa = *sa;
@@ -484,10 +496,11 @@ client_init(int argc, char **argv, void *self)
     int option;
     struct rs_object_base *rs_obj; 
 	struct config_info *config_info;
+    struct event *signal_event;
 	
 	rs_obj = (struct rs_object_base *)self;
 
-	config_info = (struct config_info *)calloc(1, sizeof(struct config_info));
+	config_info = (struct config_info *)CALLOC(1, sizeof(struct config_info));
 	assert(config_info);
 
     loglevel = ERROR;
@@ -579,6 +592,11 @@ client_init(int argc, char **argv, void *self)
         assert(config_info->local_info[i].listener);
 	}
 
+    //signal event
+    signal_event = evsignal_new(rs_obj->base, SIGPIPE, signal_cb, self);
+    assert(signal_event);
+    evsignal_add(signal_event, NULL);
+
 	srand(time(NULL));
 
     return 0;
@@ -607,7 +625,7 @@ client_destroy(void *self)
 
     event_base_free(rs_obj->base);
 
-    free(config_info);
+    FREE(config_info);
 }
 
 static struct rs_object_base rs_obj = {
