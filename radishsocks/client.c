@@ -45,6 +45,7 @@
 #define SERVER_INFO_MAX 16  //max server
 #define LOCAL_INFO_MAX  64  //max listener
 
+
 struct server_info{ //server
     char server_ip[IP_ADDRESS_MAX];
     char server_pwd[PASSWORD_MAX];
@@ -57,6 +58,14 @@ struct local_info{ //local
     struct evconnlistener *listener;
 };
 
+struct manager_info{ //manager
+    char server_ip[IP_ADDRESS_MAX];
+    char server_pwd[PASSWORD_MAX];
+    int  server_port;
+
+    struct event_base *base;
+};
+
 struct config_info{
 	int server_info_count;
     struct server_info server_info[SERVER_INFO_MAX]; //muti server
@@ -64,7 +73,7 @@ struct config_info{
 	int local_info_count;
     struct local_info local_info[LOCAL_INFO_MAX]; //muti local
 
-    struct server_info manager_info; //single manager
+    struct manager_info manager_info; //single manager
 };
 
 struct ev_container{
@@ -76,6 +85,9 @@ struct ev_container{
 
 	struct server_info *server_info; //event server info
 };
+
+static int
+create_manager(struct event_base *base, struct manager_info *manager_info);
 
 static int
 verify_auth(const char *username, const char *password)
@@ -137,6 +149,39 @@ conn_writecb(struct bufferevent *bev, void *user_data)
 }
 
 static void
+manager_reconnect(evutil_socket_t fd, short event, void *user_data)
+{
+    struct manager_info *manager_info = user_data;
+
+    create_manager(manager_info->base, manager_info);
+}
+
+static void
+manager_eventcb(struct bufferevent *bev, short events, void *user_data)
+{
+	struct timeval tv;
+    struct event *timeout = NULL;
+    struct manager_info *manager_info = user_data;
+
+	if (events & BEV_EVENT_EOF) {
+		vlog(INFO, "Connection closed.\n");
+	} else if (events & BEV_EVENT_ERROR) {
+		vlog(INFO, "Got an error on the connection: %s\n",
+		    strerror(errno));/*XXX win32*/
+	} else if (events & BEV_EVENT_CONNECTED) {
+		vlog(INFO, "Connection ok.\n");
+        return;
+	}
+
+    bufferevent_free(bev);
+
+	timeout = evtimer_new(manager_info->base, manager_reconnect, (void *)manager_info);
+	evutil_timerclear(&tv);
+	tv.tv_sec = 5;
+	evtimer_add(timeout, &tv);
+}
+
+static void
 conn_eventcb(struct bufferevent *bev, short events, void *user_data)
 {
 	struct ev_container *evc = user_data;
@@ -152,7 +197,22 @@ conn_eventcb(struct bufferevent *bev, short events, void *user_data)
 
 	/* None of the other events can happen here, since we haven't enabled
 	 * timeouts */
-	free_ev_container(evc);
+    if (evc)
+	    free_ev_container(evc);
+}
+
+static void
+manager_readcb(struct bufferevent *bev, void *user_data)
+{
+	struct evbuffer *input = bufferevent_get_input(bev);
+	ev_ssize_t datalen = 0;
+    unsigned char *data = NULL;
+
+	datalen = evbuffer_get_length(input); 
+    data = (unsigned char *)CALLOC(datalen, sizeof(unsigned char));
+	datalen = evbuffer_remove(input, data, datalen);
+
+    vlog(INFO, "manager cmd: %s\n", data);
 }
 
 //client read callback
@@ -420,14 +480,14 @@ listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
     //build bufferevent
 	bev_in = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
 	if (!bev_in) {
-		vlog(ERROR, "Error constructing bufferevent (input)!");
+		vlog(ERROR, "Error constructing bufferevent (local)!");
 		event_base_loopbreak(base);
 		return;
 	}
 
 	bev_out = bufferevent_socket_new(base, -1, BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
 	if (!bev_out) {
-		vlog(ERROR, "Error constructing bufferevent (input)!");
+		vlog(ERROR, "Error constructing bufferevent (remote)!");
 		event_base_loopbreak(base);
 		return;
 	}
@@ -458,7 +518,7 @@ listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
 		sizeof(saddr)
 	);
 	if (rc < 0) {
-		vlog(ERROR, "bufferevent socket connect\n");
+		vlog(ERROR, "bufferevent socket connect error (remote)\n");
 		free_ev_container(evc);
 		return;
 	}
@@ -478,21 +538,55 @@ static void
 usage()
 {
     vlog(ERROR, 
-        "Usage: rssocks [-v 0/1/2] -s x.x.x.x [-p 9600] [-b 127.0.0.1 -l 1080] [-m xx.xx.xx.xx] -k password\n"
+        "Usage: %s [-v 0/1/2] -s x.x.x.x [-p 9600] [-b 127.0.0.1 -l 1080] [-m xx.xx.xx.xx] -k password\n"
         "\t-v <verbose>: 0 default/ 1 debug/ 2 info\n"
         "\t-s <serverIP>: rsserver address\n"
         "\t-p <serverPort>: rsserver listen port\n"
         "\t-b <localAddress>: local bind address\n"
         "\t-l <localPort>: local bind port\n"
         "\t-m <manager>: manager address\n"
-        "\t-k <password>: password\n"
+        "\t-k <password>: password\n",
+    NAME);
+}
+
+static int
+create_manager(struct event_base *base, struct manager_info *manager_info)
+{
+    int rc = 0;
+	struct bufferevent *bev_manager = NULL;
+    struct sockaddr_in saddr;
+
+    bev_manager = bufferevent_socket_new(base, -1, BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
+    if (!bev_manager) {
+        vlog(ERROR, "Error constructing bufferevent (manager)!");
+        return -1;
+    }
+
+    memset(&saddr, 0, sizeof(struct sockaddr_in));
+    saddr.sin_family = AF_INET;
+    saddr.sin_addr.s_addr = inet_addr(manager_info->server_ip);
+    saddr.sin_port = htons(manager_info->server_port);
+
+    rc = bufferevent_socket_connect(
+        bev_manager,
+        (struct sockaddr *)&saddr,
+        sizeof(saddr)
     );
+    if (rc < 0) {
+        vlog(ERROR, "bufferevent socket connect error (manager)\n");
+        return -1;
+    }
+
+    bufferevent_setcb(bev_manager, manager_readcb, conn_writecb, manager_eventcb, manager_info);
+    bufferevent_enable(bev_manager, EV_READ);
+
+    return 0;
 }
 
 static int 
 client_init(int argc, char **argv, void *self)
 {
-	int i;
+	int i, rc = 0;
     int option;
     struct rs_object_base *rs_obj; 
 	struct config_info *config_info;
@@ -579,6 +673,14 @@ client_init(int argc, char **argv, void *self)
     assert(rs_obj->base);
 
 	rs_obj->user_data = config_info;
+
+    //create manager
+    if (config_info->manager_info.server_ip[0] != '\0'){
+        config_info->manager_info.base = rs_obj->base;
+        rc = create_manager(rs_obj->base, &config_info->manager_info);
+        if (rc != 0)
+            return -1;
+    }
 
 	//create listener 
 	for (i = 0; i < config_info->local_info_count; i++)

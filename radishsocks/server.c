@@ -375,12 +375,12 @@ static void
 usage()
 {
     vlog(ERROR, 
-        "Usage: \n"
+        "Usage: %s [-v 0/1/2] [-b 127.0.0.1] [-l 9600] -k password\n"
         "\t-v <verbose>: 0 DEFAULT/1 DEBUG/2 INFO\n"
         "\t-b <localAddress>: local bind address\n"
         "\t-l <localPort>: local bind port\n"
-        "\t-k <password>: password\n"
-    );
+        "\t-k <password>: password\n",
+    NAME);
 }
 
 static int 
