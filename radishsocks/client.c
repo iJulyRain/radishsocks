@@ -683,8 +683,7 @@ client_init(int argc, char **argv, void *self)
     }
 
 	//create listener 
-	for (i = 0; i < config_info->local_info_count; i++)
-	{
+	for (i = 0; i < config_info->local_info_count; i++){
 		config_info->local_info[i].listener = create_listener(
 			config_info->local_info[i].local_ip,
 			config_info->local_info[i].local_port,
@@ -717,8 +716,7 @@ client_destroy(void *self)
 	event_base_dispatch(rs_obj->base);
 
 	//free listener
-	for (i = 0; i < LOCAL_INFO_MAX; i++)
-	{
+	for (i = 0; i < LOCAL_INFO_MAX; i++){
 		if (!config_info->local_info[i].listener)
 			continue;
 

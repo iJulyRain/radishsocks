@@ -15,11 +15,13 @@ set(CMAKE_C_FLAGS "-Wall -g ")
 include_directories(
 ${PROJECT_SOURCE_DIR}/radishsocks/
 ${PROJECT_SOURCE_DIR}/libevent/include/
+${PROJECT_SOURCE_DIR}/tcmalloc/include/
 )
 
 link_directories(
 ${PROJECT_SOURCE_DIR}/radishsocks/
 ${PROJECT_SOURCE_DIR}/libevent/lib/
+${PROJECT_SOURCE_DIR}/tcmalloc/lib/
 )
 
 add_subdirectory(radishsocks)
