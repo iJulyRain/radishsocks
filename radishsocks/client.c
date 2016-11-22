@@ -16,75 +16,7 @@
  * =====================================================================================
  */
 
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <errno.h>
-#include <time.h>
-#include <signal.h>
-
-#include <getopt.h>
-
-#include <assert.h>
-
-#include "log.h"
-#include "cipher.h"
-#include "base.h"
-
-#include "common.h"
-
-#define NAME "rs-client"
-
-#define STAGE_INIT    0x00
-#define STAGE_VERSION 0x01
-#define STAGE_AUTH    0x02
-#define STAGE_ADDR    0x03
-#define STAGE_STREAM  0x04
-
-#define SERVER_INFO_MAX 16  //max server
-#define LOCAL_INFO_MAX  64  //max listener
-
-
-struct server_info{ //server
-    char server_ip[IP_ADDRESS_MAX];
-    char server_pwd[PASSWORD_MAX];
-    int  server_port;
-};
-
-struct local_info{ //local
-    char local_ip[IP_ADDRESS_MAX];
-    int  local_port;
-    struct evconnlistener *listener;
-};
-
-struct manager_info{ //manager
-    char server_ip[IP_ADDRESS_MAX];
-    char server_pwd[PASSWORD_MAX];
-    int  server_port;
-
-    struct event_base *base;
-};
-
-struct config_info{
-	int server_info_count;
-    struct server_info server_info[SERVER_INFO_MAX]; //muti server
-
-	int local_info_count;
-    struct local_info local_info[LOCAL_INFO_MAX]; //muti local
-
-    struct manager_info manager_info; //single manager
-};
-
-struct ev_container{
-	struct bufferevent *bev_local, *bev_remote;
-    struct event *timeout_ev;
-    struct sockaddr sa;
-
-	int stage;
-
-	struct server_info *server_info; //event server info
-};
+#include "client.h"
 
 static int
 create_manager(struct event_base *base, struct manager_info *manager_info);
@@ -108,6 +40,11 @@ free_ev_container(struct ev_container *evc)
 	if (evc->bev_remote){
     	bufferevent_free(evc->bev_remote);
 		evc->bev_remote = NULL;
+	}
+
+	if (evc->bev_udp){
+    	bufferevent_free(evc->bev_udp);
+		evc->bev_udp = NULL;
 	}
 	
 	if (evc->timeout_ev){
@@ -215,6 +152,64 @@ manager_readcb(struct bufferevent *bev, void *user_data)
     vlog(INFO, "manager cmd: %s\n", data);
 }
 
+static void
+udp_readcb(struct bufferevent *bev, void *user_data)
+{
+    int rc = 0;
+	struct evbuffer *input = bufferevent_get_input(bev);
+	struct ev_container *evc = user_data;
+	ev_ssize_t datalen = 0;
+    unsigned char *data = NULL;
+    struct domain_info domain_info;
+    object_t server_table_node;
+    char buffer[256];
+    uint32_t hash[4];
+
+	datalen = evbuffer_get_length(input); 
+    if (datalen < 11){
+        vlog(ERROR, "UDP package too short\n");
+        return;
+    }
+
+    do{
+        data = (unsigned char *)CALLOC(datalen, sizeof(unsigned char));
+        datalen = evbuffer_remove(input, data, datalen);
+
+        if (data[0] != 0x00 || data[1] != 0x00){
+            vlog(ERROR, "UDP bad package\n");
+            break;
+        }
+
+        memset(&domain_info, 0, sizeof(domain_info));
+        rc = parse_header(data, datalen, &domain_info);
+        if (rc != 0){
+            vlog(ERROR, "UDP bad header\n");
+            break;
+        }
+
+        //insert server table
+        server_table_node = (object_t)calloc(1, sizeof(struct object));
+        assert(server_table_node);
+
+        memset(buffer, 0, sizeof(buffer));
+        snprintf(buffer, 255, "%s:%d", domain_info.address, domain_info.port);
+        rs_md5((uint8_t*)buffer, strlen(buffer), hash);
+
+        snprintf(server_table_node->name, OBJ_NAME_MAX - 1, "%08x%08x%08x%08x", hash[0], hash[1], hash[2], hash[3]);
+        vlog(INFO, "%s:%d hash(%s)\n", domain_info.address, domain_info.port, server_table_node->name);
+
+        if (!object_container_find(server_table_node->name, &evc->udp_server_table))
+            object_container_addend(server_table_node, &evc->udp_server_table);
+        
+        //relay to server
+        rs_encrypt(data, data, datalen, evc->server_info->server_pwd);
+        bufferevent_write(evc->bev_remote, data, datalen);
+        bufferevent_enable(evc->bev_remote, EV_WRITE);
+    }while(0);
+
+    FREE(data);
+}
+
 //client read callback
 static void
 remote_readcb(struct bufferevent *bev, void *user_data)
@@ -223,7 +218,7 @@ remote_readcb(struct bufferevent *bev, void *user_data)
 	struct ev_container *evc = user_data;
     struct bufferevent *partner = evc->bev_local;
 	ev_ssize_t datalen = 0;
-    unsigned char *data = NULL, *outdata = NULL;
+    unsigned char *data = NULL;
     unsigned char output[16];
 
 	datalen = evbuffer_get_length(input); 
@@ -231,11 +226,10 @@ remote_readcb(struct bufferevent *bev, void *user_data)
 	datalen = evbuffer_remove(input, data, datalen);
 
     //TODO decrypt
-    outdata = (unsigned char *)CALLOC(datalen, sizeof(unsigned char));
-    rs_decrypt(data, outdata, datalen, evc->server_info->server_pwd);
+    rs_decrypt(data, data, datalen, evc->server_info->server_pwd);
 
 	vlog(INFO, "REMOTE RECV(%d)\n", datalen);
-    vlog_array(INFO, outdata, datalen);
+    vlog_array(INFO, data, datalen);
 
     reset_timer(evc->timeout_ev, BEV_TIMEOUT);
 
@@ -258,14 +252,19 @@ remote_readcb(struct bufferevent *bev, void *user_data)
 
         case STAGE_STREAM:
         {
-            bufferevent_write(partner, outdata, datalen);
+            bufferevent_write(partner, data, datalen);
             bufferevent_enable(partner, EV_WRITE);
+        }
+            break;
+
+        case STAGE_UDP:
+        {
+
         }
             break;
     }
 
     FREE(data);
-    FREE(outdata);
 }
 
 //local server read callback
@@ -275,9 +274,10 @@ local_readcb(struct bufferevent *bev, void *user_data)
 	struct evbuffer *input = bufferevent_get_input(bev);
 	struct ev_container *evc = user_data;
     struct bufferevent *partner = evc->bev_remote;
+    struct event_base *base;
     struct domain_info domain_info;
 	ev_ssize_t datalen = 0;
-	unsigned char *data = NULL, *outdata = NULL;
+	unsigned char *data = NULL;
     unsigned char output[16];
    
 	datalen = evbuffer_get_length(input); 
@@ -288,6 +288,8 @@ local_readcb(struct bufferevent *bev, void *user_data)
 	vlog_array(INFO, data, datalen);
 
     reset_timer(evc->timeout_ev, BEV_TIMEOUT);
+
+    base = bufferevent_get_base(bev);
 
 	switch (evc->stage)
 	{
@@ -404,46 +406,104 @@ local_readcb(struct bufferevent *bev, void *user_data)
                 break;
 			}
 
-            if (data[1] != 0x01){
-				vlog(ERROR, "Only Supported TCP relay\n");
+            if (data[1] != 0x01 && data[1] != 0x03){
+				vlog(ERROR, "Unknown relay type\n");
 				free_ev_container(evc);
 
                 break;
             }
 
-            memset(&domain_info, 0, sizeof(struct domain_info));
+            if (data[1] == 0x01){ //TCP Relay 
+                memset(&domain_info, 0, sizeof(struct domain_info));
 
-            parse_header(data, datalen, &domain_info);
-            vlog(DEBUG, "==> <%s:%d> connect to <%s:%d>\n", 
-                inet_ntoa(((struct sockaddr_in *)&evc->sa)->sin_addr),
-                ntohs(((struct sockaddr_in *)&evc->sa)->sin_port),
-                domain_info.address,
-                domain_info.port
-            );
+                parse_header(data, datalen, &domain_info);
+                vlog(DEBUG, "==> <%s:%d> connect to <%s:%d>\n", 
+                    inet_ntoa(((struct sockaddr_in *)&evc->sa)->sin_addr),
+                    ntohs(((struct sockaddr_in *)&evc->sa)->sin_port),
+                    domain_info.address,
+                    domain_info.port
+                );
 
-			//TODO encrypt
-            data[0] = 0xFF;
-            outdata = (unsigned char *)CALLOC(datalen, sizeof(unsigned char));
-            rs_encrypt(data, outdata, datalen, evc->server_info->server_pwd);
+                //TODO encrypt
+                data[0] = 0xFF;
+                rs_encrypt(data, data, datalen, evc->server_info->server_pwd);
 
-			bufferevent_write(partner, outdata, datalen);
-			bufferevent_enable(partner, EV_WRITE);
+                bufferevent_write(partner, data, datalen);
+                bufferevent_enable(partner, EV_WRITE);
 
-            FREE(outdata);
+                evc->stage = STAGE_ADDR;
+            } else if (data[1] == 0x03){ //UDP Relay
+                struct sockaddr_in addr;
+                socklen_t addrlen; 
+                evutil_socket_t fd;
+                char ip[IP_ADDRESS_MAX];
+                int port;
 
-			evc->stage = STAGE_ADDR;
+                addrlen = sizeof(addr);
+
+                //getsockname
+                fd = bufferevent_getfd(bev);
+
+                memset(&addr, 0, sizeof(addr));
+                getsockname(fd, (struct sockaddr *)&addr, &addrlen);
+
+                memset(ip, 0, IP_ADDRESS_MAX);
+                strncpy(ip, inet_ntoa(addr.sin_addr), IP_ADDRESS_MAX - 1);
+
+                //new udp socket
+                fd = socket(AF_INET, SOCK_DGRAM, 0); 
+                if (fd < 0){
+                    vlog(ERROR, "Create socket error (UDP)\n");
+                    free_ev_container(evc);
+                    break;
+                }
+
+                memset(&addr, 0, sizeof(addr));
+                addr.sin_family = AF_INET;
+                addr.sin_port = htons(0); //os select
+                addr.sin_addr.s_addr = inet_addr(ip);
+                bind(fd, (struct sockaddr *)&addr, addrlen);
+
+                //bufferevent
+                evc->bev_udp = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
+                if (!evc->bev_udp) {
+                    vlog(ERROR, "Error constructing bufferevent (udp)!");
+                    free_ev_container(evc);
+                    break;
+                }
+
+                bufferevent_setcb(evc->bev_udp, udp_readcb, conn_writecb, conn_eventcb, (void *)evc);
+                bufferevent_enable(evc->bev_udp, EV_READ);
+
+                object_container_init(&evc->udp_server_table);
+
+                //response
+                memset(&addr, 0, sizeof(addr));
+                getsockname(fd, (struct sockaddr *)&addr, &addrlen);
+                port = ntohs(addr.sin_port);
+                vlog(DEBUG, "UDP bind: %s:%d\n", ip, port);
+
+                memset(output, 0, sizeof(output));
+                output[0] = 0x05; output[1] = 0x00; output[2] = 0x00; output[3] = 0x01;
+                memcpy(output + 4, &addr.sin_addr.s_addr, 4);
+                memcpy(output + 8, &addr.sin_port, 2);
+                
+                vlog_array(INFO, output, 10);
+
+                bufferevent_write(bev, output, 10);
+                bufferevent_enable(bev, EV_WRITE);
+
+                evc->stage = STAGE_UDP;
+            }
 		}
 			break;
 		case STAGE_STREAM:
 		{
 			//TODO encrypt
-            outdata = (unsigned char *)CALLOC(datalen, sizeof(unsigned char));
-            rs_encrypt(data, outdata, datalen, evc->server_info->server_pwd);
+            rs_encrypt(data, data, datalen, evc->server_info->server_pwd);
 
-			bufferevent_write(partner, outdata, datalen);
+			bufferevent_write(partner, data, datalen);
 			bufferevent_enable(partner, EV_WRITE);
-
-            FREE(outdata);
 		}
 			break;
 	}
@@ -538,13 +598,14 @@ static void
 usage()
 {
     vlog(ERROR, 
-        "Usage: %s [-v 0/1/2] -s x.x.x.x [-p 9600] [-b 127.0.0.1 -l 1080] [-m xx.xx.xx.xx] -k password\n"
+        "Usage: %s [-v 0/1/2] -s x.x.x.x [-p 9600] [-b 127.0.0.1 -l 1080] [-m xx.xx.xx.xx -q password] -k password\n"
         "\t-v <verbose>: 0 default/ 1 debug/ 2 info\n"
         "\t-s <serverIP>: rsserver address\n"
         "\t-p <serverPort>: rsserver listen port\n"
         "\t-b <localAddress>: local bind address\n"
         "\t-l <localPort>: local bind port\n"
         "\t-m <manager>: manager address\n"
+        "\t-q <password>: manager password\n",
         "\t-k <password>: password\n",
     NAME);
 }
@@ -599,7 +660,7 @@ client_init(int argc, char **argv, void *self)
 
     loglevel = ERROR;
 
-    while ((option = getopt(argc, argv, "v:s:p:b:l:k:m:")) > 0){
+    while ((option = getopt(argc, argv, "v:s:p:b:l:k:m:q:")) > 0){
         switch (option) {
         case 'v':
             loglevel = atoi(optarg);
@@ -642,6 +703,12 @@ client_init(int argc, char **argv, void *self)
                 IP_ADDRESS_MAX - 1);
 			config_info->manager_info.server_port = 12800; //default manager port
             break;
+        case 'q':
+            strncpy(
+                config_info->manager_info.server_pwd, 
+                optarg,
+                PASSWORD_MAX - 1);
+            break;
         default:
 			usage();
 			return -1;
@@ -675,7 +742,8 @@ client_init(int argc, char **argv, void *self)
 	rs_obj->user_data = config_info;
 
     //create manager
-    if (config_info->manager_info.server_ip[0] != '\0'){
+    if (config_info->manager_info.server_ip[0] != '\0'
+    &&  config_info->manager_info.server_pwd[0] != '\0'){
         config_info->manager_info.base = rs_obj->base;
         rc = create_manager(rs_obj->base, &config_info->manager_info);
         if (rc != 0)
