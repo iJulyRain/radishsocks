@@ -18,6 +18,26 @@
 #ifndef __RS_SERVER_H__
 #define __RS_SERVER_H__
 
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <errno.h>
+#include <signal.h>
+
+#include <getopt.h>
+
+#include <assert.h>
+
+#include <event2/dns.h>
+#include <event2/dns_struct.h>
+
+#include "log.h"
+#include "cipher.h"
+#include "base.h"
+
+#include "common.h"
+
 void register_rs_object_server(void);
 
 #endif

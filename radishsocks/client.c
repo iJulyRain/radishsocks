@@ -18,6 +18,65 @@
 
 #include "client.h"
 
+#define NAME "rs-client"
+
+struct server_info{ //server
+    char server_ip[IP_ADDRESS_MAX];
+    char server_pwd[PASSWORD_MAX];
+    int  server_port;
+};
+
+struct local_info{ //local
+    char local_ip[IP_ADDRESS_MAX];
+    int  local_port;
+    struct evconnlistener *listener;
+};
+
+struct manager_info{ //manager
+    char server_ip[IP_ADDRESS_MAX];
+    char server_pwd[PASSWORD_MAX];
+    int  server_port;
+
+    struct event_base *base;
+};
+
+struct config_info{
+	int server_info_count;
+    struct server_info server_info[SERVER_INFO_MAX]; //muti server
+
+	int local_info_count;
+    struct local_info local_info[LOCAL_INFO_MAX]; //muti local
+
+    struct manager_info manager_info; //single manager
+};
+
+struct ev_container{
+	struct bufferevent *bev_local, *bev_remote;
+    struct event *ev_udp; //udp proxy 
+
+    unsigned char *buffer_in;
+
+    struct object_container udp_server_table; //udp server table 
+    struct sockaddr usa; //udp sa
+    socklen_t usa_len; //udp
+
+    struct event *timeout_ev;
+    struct sockaddr sa; //local
+
+	int stage;
+
+	struct server_info *server_info; //event server info
+};
+
+struct udp_write_block{
+    struct event *event;
+    unsigned char *buffer;
+    size_t buffer_size;
+
+    struct sockaddr sa;
+    socklen_t sa_len;
+};
+
 static int
 create_manager(struct event_base *base, struct manager_info *manager_info);
 
@@ -42,10 +101,15 @@ free_ev_container(struct ev_container *evc)
 		evc->bev_remote = NULL;
 	}
 
-	if (evc->bev_udp){
-    	bufferevent_free(evc->bev_udp);
-		evc->bev_udp = NULL;
+	if (evc->ev_udp){
+    	event_free(evc->ev_udp);
+		evc->ev_udp = NULL;
 	}
+
+    if (evc->buffer_in){
+        FREE(evc->buffer_in);
+        evc->buffer_in = NULL;
+    }
 	
 	if (evc->timeout_ev){
 		evtimer_del(evc->timeout_ev);
@@ -147,46 +211,57 @@ manager_readcb(struct bufferevent *bev, void *user_data)
 
 	datalen = evbuffer_get_length(input); 
     data = (unsigned char *)CALLOC(datalen, sizeof(unsigned char));
-	datalen = evbuffer_remove(input, data, datalen);
+	datalen = bufferevent_read(bev, data, datalen);
 
     vlog(INFO, "manager cmd: %s\n", data);
 }
 
-static void
-udp_readcb(struct bufferevent *bev, void *user_data)
+static void udp_cb(evutil_socket_t fd, short which, void *user_data)
 {
-    int rc = 0;
-	struct evbuffer *input = bufferevent_get_input(bev);
-	struct ev_container *evc = user_data;
-	ev_ssize_t datalen = 0;
+    int rc, datalen;
+    struct sockaddr sa; 
+    socklen_t socklen;
+	struct ev_container *evc;
+    struct udp_write_block *uwb;
     unsigned char *data = NULL;
     struct domain_info domain_info;
-    object_t server_table_node;
-    char buffer[256];
-    uint32_t hash[4];
+    //object_t server_table_node;
+    //char buffer[256];
+    //uint32_t hash[4];
 
-	datalen = evbuffer_get_length(input); 
-    if (datalen < 11){
-        vlog(ERROR, "UDP package too short\n");
-        return;
-    }
+    if (which & EV_READ){
+        evc = user_data;
+        data = evc->buffer_in;
 
-    do{
-        data = (unsigned char *)CALLOC(datalen, sizeof(unsigned char));
-        datalen = evbuffer_remove(input, data, datalen);
+        socklen = sizeof(sa);
+        memset(&sa, 0, sizeof(sa));
+        memset(data, 0, BUFFER_MAX);
+
+        datalen = recvfrom(fd, data, BUFFER_MAX, 0, &sa, &socklen);
+        if (datalen < 0){
+            vlog(ERROR, "UDP recvfrom error!\n");
+            return;
+        }
+
+        evc->usa = sa;
+        evc->usa_len = socklen;
+
+        vlog(INFO, "UDP RECV(%d)\n", datalen);
+        vlog_array(INFO, data, datalen);
 
         if (data[0] != 0x00 || data[1] != 0x00){
             vlog(ERROR, "UDP bad package\n");
-            break;
+            return;
         }
 
         memset(&domain_info, 0, sizeof(domain_info));
         rc = parse_header(data, datalen, &domain_info);
         if (rc != 0){
             vlog(ERROR, "UDP bad header\n");
-            break;
+            return;
         }
 
+        /*
         //insert server table
         server_table_node = (object_t)calloc(1, sizeof(struct object));
         assert(server_table_node);
@@ -200,14 +275,23 @@ udp_readcb(struct bufferevent *bev, void *user_data)
 
         if (!object_container_find(server_table_node->name, &evc->udp_server_table))
             object_container_addend(server_table_node, &evc->udp_server_table);
-        
+        */
+
         //relay to server
         rs_encrypt(data, data, datalen, evc->server_info->server_pwd);
         bufferevent_write(evc->bev_remote, data, datalen);
         bufferevent_enable(evc->bev_remote, EV_WRITE);
-    }while(0);
+    } else if (which & EV_WRITE) {
+        uwb = user_data;
 
-    FREE(data);
+        data = uwb->buffer;
+        datalen = uwb->buffer_size;
+        sendto(fd, data, datalen, 0, &uwb->sa, uwb->sa_len);
+
+        event_free(uwb->event);
+        FREE(uwb->buffer);
+        FREE(uwb);
+    }
 }
 
 //client read callback
@@ -223,7 +307,7 @@ remote_readcb(struct bufferevent *bev, void *user_data)
 
 	datalen = evbuffer_get_length(input); 
     data = (unsigned char *)CALLOC(datalen, sizeof(unsigned char));
-	datalen = evbuffer_remove(input, data, datalen);
+	datalen = bufferevent_read(bev, data, datalen);
 
     //TODO decrypt
     rs_decrypt(data, data, datalen, evc->server_info->server_pwd);
@@ -259,7 +343,24 @@ remote_readcb(struct bufferevent *bev, void *user_data)
 
         case STAGE_UDP:
         {
+            struct event_base *base;
+            evutil_socket_t fd;
+            struct udp_write_block *uwb = (struct udp_write_block *)CALLOC(1, sizeof(struct udp_write_block));
+            assert(uwb);
 
+            base = bufferevent_get_base(bev);
+            fd = event_get_fd(evc->ev_udp); 
+
+            uwb->event = event_new(base, fd, EV_WRITE, udp_cb, (void *)uwb);
+            uwb->buffer = (unsigned char *)CALLOC(BUFFER_MAX, sizeof(unsigned char));
+            assert(uwb->buffer);
+
+            memcpy(uwb->buffer, data, datalen);
+            uwb->buffer_size = datalen;
+            uwb->sa = evc->usa;
+            uwb->sa_len = evc->usa_len;
+
+            event_add(uwb->event, NULL);
         }
             break;
     }
@@ -282,7 +383,7 @@ local_readcb(struct bufferevent *bev, void *user_data)
    
 	datalen = evbuffer_get_length(input); 
 	data = (unsigned char *)CALLOC(datalen, sizeof(unsigned char));
-	datalen = evbuffer_remove(input, data, datalen);
+	datalen = bufferevent_read(bev, data, datalen);
 
 	vlog(INFO, "LOCAL RECV(%d)\n", datalen);
 	vlog_array(INFO, data, datalen);
@@ -407,7 +508,7 @@ local_readcb(struct bufferevent *bev, void *user_data)
 			}
 
             if (data[1] != 0x01 && data[1] != 0x03){
-				vlog(ERROR, "Unknown relay type\n");
+				vlog(ERROR, "Unknown relay type(%d)\n", data[1]);
 				free_ev_container(evc);
 
                 break;
@@ -432,7 +533,7 @@ local_readcb(struct bufferevent *bev, void *user_data)
                 bufferevent_enable(partner, EV_WRITE);
 
                 evc->stage = STAGE_ADDR;
-            } else if (data[1] == 0x03){ //UDP Relay
+            } else if (data[1] == 0x03) { //UDP Relay
                 struct sockaddr_in addr;
                 socklen_t addrlen; 
                 evutil_socket_t fd;
@@ -464,18 +565,14 @@ local_readcb(struct bufferevent *bev, void *user_data)
                 addr.sin_addr.s_addr = inet_addr(ip);
                 bind(fd, (struct sockaddr *)&addr, addrlen);
 
-                //bufferevent
-                evc->bev_udp = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
-                if (!evc->bev_udp) {
-                    vlog(ERROR, "Error constructing bufferevent (udp)!");
-                    free_ev_container(evc);
-                    break;
-                }
-
-                bufferevent_setcb(evc->bev_udp, udp_readcb, conn_writecb, conn_eventcb, (void *)evc);
-                bufferevent_enable(evc->bev_udp, EV_READ);
-
+                //udp cb
+                evc->ev_udp = event_new(base, fd, EV_READ | EV_PERSIST, udp_cb, (void *)evc);
                 object_container_init(&evc->udp_server_table);
+
+                evc->buffer_in = (unsigned char *)CALLOC(BUFFER_MAX, sizeof(unsigned char));
+                assert(evc->buffer_in);
+
+                event_add(evc->ev_udp, NULL);
 
                 //response
                 memset(&addr, 0, sizeof(addr));
@@ -531,7 +628,7 @@ listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
 
 	base = rs_obj->base;
 
-	server_i = rand() % config_info->server_info_count;
+	server_i = rand() % config_info->server_info_count; //choose one server random 
 
 	vlog(DEBUG, "new client from %s:%d ==> using tunnel: %s:%d\n", 
 		inet_ntoa(((struct sockaddr_in *)sa)->sin_addr), ntohs(((struct sockaddr_in *)sa)->sin_port),
@@ -569,8 +666,8 @@ listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
 	//<connect to server
     memset(&saddr, 0, sizeof(struct sockaddr_in));
     saddr.sin_family = AF_INET;
-    saddr.sin_port = htons(config_info->server_info[server_i].server_port);
-    saddr.sin_addr.s_addr = inet_addr(config_info->server_info[server_i].server_ip);
+    saddr.sin_port = htons(evc->server_info->server_port);
+    saddr.sin_addr.s_addr = inet_addr(evc->server_info->server_ip);
 
 	rc = bufferevent_socket_connect(
 		bev_out,

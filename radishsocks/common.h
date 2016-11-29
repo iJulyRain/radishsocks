@@ -23,10 +23,12 @@
 
 #define ADDRESS_MAX 256 
 
-#define BEV_TIMEOUT 30
+#define BEV_TIMEOUT 180 
 
 #define IP_ADDRESS_MAX   32
 #define PASSWORD_MAX  32 
+
+#define BUFFER_MAX 4096
 
 #define CALLOC tc_calloc
 #define FREE tc_free

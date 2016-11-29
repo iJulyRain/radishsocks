@@ -16,25 +16,7 @@
  * =====================================================================================
  */
 
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <errno.h>
-#include <signal.h>
-
-#include <getopt.h>
-
-#include <assert.h>
-
-#include <event2/dns.h>
-#include <event2/dns_struct.h>
-
-#include "log.h"
-#include "cipher.h"
-#include "base.h"
-
-#include "common.h"
+#include "server.h"
 
 #define NAME "rs-server"
 
@@ -61,13 +43,30 @@ struct config_info{
 
 struct ev_container{
 	struct bufferevent *bev_local, *bev_remote;
+    struct event *ev_udp; //udp proxy 
+
+    unsigned char *buffer_in;
+    size_t buffer_in_size;
+
     struct event *timeout_ev;
     struct sockaddr sa, sa_remote;
     struct evdns_getaddrinfo_request *dns_req;
 	struct domain_info domain_info;
 
 	struct local_info *local_info;
-	struct evdns_base *evdns_base;
+	struct evdns_base *evdns_base; //point to config_info->dns_base
+};
+
+struct udp_write_block{
+    struct event *event;
+    unsigned char *buffer;
+    size_t buffer_size;
+
+    struct sockaddr sa;
+    socklen_t sa_len;
+
+	struct domain_info domain_info;
+    struct evdns_getaddrinfo_request *dns_req;
 };
 
 static void
@@ -82,6 +81,16 @@ free_ev_container(struct ev_container *evc)
     	bufferevent_free(evc->bev_remote);
 		evc->bev_remote = NULL;
 	}
+
+	if (evc->ev_udp){
+    	event_free(evc->ev_udp);
+		evc->ev_udp = NULL;
+	}
+
+    if (evc->buffer_in){
+        FREE(evc->buffer_in);
+        evc->buffer_in = NULL;
+    }
 	
 	if (evc->timeout_ev){
 		evtimer_del(evc->timeout_ev);
@@ -94,7 +103,7 @@ free_ev_container(struct ev_container *evc)
         evc->dns_req = NULL;
     }
 
-	free(evc);
+	FREE(evc);
 }
 
 static void
@@ -146,6 +155,15 @@ conn_eventcb(struct bufferevent *bev, short events, void *user_data)
 	free_ev_container(evc);
 }
 
+static void udp_cb(evutil_socket_t fd, short which, void *user_data)
+{
+    if (which & EV_READ){
+
+    } else if (which & EV_WRITE) {
+
+    }
+}
+
 //client read callback
 static void
 remote_readcb(struct bufferevent *bev, void *user_data)
@@ -157,7 +175,7 @@ remote_readcb(struct bufferevent *bev, void *user_data)
 	unsigned char *data = NULL, *outdata = NULL;
 
 	datalen = evbuffer_get_length(input); 
-	data = (unsigned char *)calloc(datalen, sizeof(unsigned char));
+	data = (unsigned char *)CALLOC(datalen, sizeof(unsigned char));
 	assert(data);
 
 	datalen = evbuffer_remove(input, data, datalen);
@@ -167,15 +185,47 @@ remote_readcb(struct bufferevent *bev, void *user_data)
     reset_timer(evc->timeout_ev, BEV_TIMEOUT);
 
     //TODO encrypt
-    outdata = (unsigned char *)calloc(datalen, sizeof(unsigned char));
+    outdata = (unsigned char *)CALLOC(datalen, sizeof(unsigned char));
     rs_encrypt(data, outdata, datalen, evc->local_info->local_pwd);
     //memcpy(outdata, data, datalen);
 
     bufferevent_write(partner, outdata, datalen);
     bufferevent_enable(partner, EV_WRITE);
 
-	free(data);
-    free(outdata);
+	FREE(data);
+    FREE(outdata);
+}
+
+static void
+udp_dns_cb(int errcode, struct evutil_addrinfo *addr, void *ptr)
+{
+    struct udp_write_block *uwb = ptr;
+    struct evutil_addrinfo *ai;
+	uint32_t address = 0;
+
+    uwb->dns_req = NULL;
+
+    if (errcode){
+        vlog(ERROR, "-> %s\n", evutil_gai_strerror(errcode));
+        return;
+    }
+
+    for (ai = addr; ai; ai = ai->ai_next){
+        if (ai->ai_family == AF_INET){
+            address = ((struct sockaddr_in *)ai->ai_addr)->sin_addr.s_addr;
+            break;
+        }
+    }
+
+    if (address == 0){
+        vlog(ERROR, "(%s) -> not answer\n", uwb->domain_info.address);
+        return;
+    }
+
+    ((struct sockaddr_in *)&uwb->sa)->sin_addr.s_addr = address;
+    vlog(INFO, "dns resolve -> %s(%s)\n", uwb->domain_info.address, inet_ntoa(((struct sockaddr_in *)&uwb->sa)->sin_addr));
+
+    event_add(uwb->event, NULL);
 }
 
 static void
@@ -206,23 +256,26 @@ dns_cb(int errcode, struct evutil_addrinfo *addr, void *ptr)
         return;
     }
 
-	((struct sockaddr_in *)&evc->sa_remote)->sin_addr.s_addr = address;
     vlog(INFO, "dns resolve -> %s(%s)\n", evc->domain_info.address, inet_ntoa(((struct sockaddr_in *)&evc->sa_remote)->sin_addr));
 
-	rc = bufferevent_socket_connect(
-		evc->bev_remote,
-		&evc->sa_remote,
-		sizeof(struct sockaddr)
-	);
-	if (rc < 0) {
-		vlog(ERROR, "bufferevent socket connect\n");
+    ((struct sockaddr_in *)&evc->sa_remote)->sin_family = AF_INET;
+    ((struct sockaddr_in *)&evc->sa_remote)->sin_port = htons(evc->domain_info.port);
+    ((struct sockaddr_in *)&evc->sa_remote)->sin_addr.s_addr = address;
 
-		free_ev_container(evc);
-		return;
-	}
+    rc = bufferevent_socket_connect(
+        evc->bev_remote,
+        &evc->sa_remote,
+        sizeof(struct sockaddr)
+    );
+    if (rc < 0) {
+        vlog(ERROR, "bufferevent socket connect\n");
 
-	bufferevent_setcb(evc->bev_remote, remote_readcb, conn_writecb, conn_eventcb, (void *)evc);
-	bufferevent_enable(evc->bev_remote, EV_READ);
+        free_ev_container(evc);
+        return;
+    }
+
+    bufferevent_setcb(evc->bev_remote, remote_readcb, conn_writecb, conn_eventcb, (void *)evc);
+    bufferevent_enable(evc->bev_remote, EV_READ);
 
     //pong
     char output[1] = {0x01};
@@ -239,43 +292,45 @@ local_readcb(struct bufferevent *bev, void *user_data)
 	struct ev_container *evc = user_data;
     struct bufferevent *partner = evc->bev_remote;
 	ev_ssize_t datalen = 0;
-	unsigned char *data = NULL, *outdata = NULL;
+	unsigned char *data = NULL;
+    struct event_base *base;
+    evutil_socket_t ufd;
+    struct event *ev_udp;
+    struct udp_write_block *uwb;
    
 	datalen = evbuffer_get_length(input); 
 
-	data = (unsigned char *)calloc(datalen, sizeof(unsigned char));
+	data = (unsigned char *)CALLOC(datalen, sizeof(unsigned char));
 	assert(data);
 
 	datalen = evbuffer_remove(input, data, datalen);
     reset_timer(evc->timeout_ev, BEV_TIMEOUT);
 
 	//<TODO decrypt
-    outdata = (unsigned char *)calloc(datalen, sizeof(unsigned char));
-    rs_decrypt(data, outdata, datalen, evc->local_info->local_pwd);
+    rs_decrypt(data, data, datalen, evc->local_info->local_pwd);
 
 	vlog(INFO, "LOCAL RECV(%d)\n", datalen);
-	vlog_array(INFO, outdata, datalen);
+	vlog_array(INFO, data, datalen);
 
 	do{
-		if ((unsigned char)outdata[0] == 0xFF) { //<addr
-			rc = parse_header(outdata, datalen, &evc->domain_info);
+		if ((unsigned char)data[0] == 0xFF) { //<addr
+			rc = parse_header(data, datalen, &evc->domain_info);
 			if (rc != 0){
 				vlog(ERROR, "bad package!\n");
 				free_ev_container(evc);
 				break;
 			}
 
-			vlog(DEBUG, "==> <%s:%d> connect to <%s:%d>\n", 
+			vlog(DEBUG, "==> (TCP) <%s:%d> connect to <%s:%d>\n", 
 				inet_ntoa(((struct sockaddr_in *)&evc->sa)->sin_addr),
 				ntohs(((struct sockaddr_in *)&evc->sa)->sin_port),
 				evc->domain_info.address,
 				evc->domain_info.port
 			);
 
-    		((struct sockaddr_in *)&evc->sa_remote)->sin_family = AF_INET;
-			((struct sockaddr_in *)&evc->sa_remote)->sin_port = htons(evc->domain_info.port);
-
 			if (evc->domain_info.type == type_ip){
+                ((struct sockaddr_in *)&evc->sa_remote)->sin_family = AF_INET;
+                ((struct sockaddr_in *)&evc->sa_remote)->sin_port = htons(evc->domain_info.port);
 				((struct sockaddr_in *)&evc->sa_remote)->sin_addr.s_addr = inet_addr(evc->domain_info.address);
 
 				rc = bufferevent_socket_connect(
@@ -296,7 +351,7 @@ local_readcb(struct bufferevent *bev, void *user_data)
 				char output[1] = {0x01};
                 bufferevent_write(bev, output, 1);
                 bufferevent_enable(bev, EV_WRITE);
-			}else if(evc->domain_info.type == type_domain){
+			} else if(evc->domain_info.type == type_domain) {
 				struct evutil_addrinfo hints;
 
 				memset(&hints, 0, sizeof(hints));
@@ -304,14 +359,75 @@ local_readcb(struct bufferevent *bev, void *user_data)
 				hints.ai_flags = EVUTIL_AI_CANONNAME;
 				evc->dns_req = evdns_getaddrinfo(evc->evdns_base, evc->domain_info.address, NULL, &hints, dns_cb, (void *)evc);
 			}
+        } else if (data[0] == 0x00 && data[1] == 0x00) { //udp relay
+            if (!evc->ev_udp) {
+                ufd = socket(AF_INET, SOCK_DGRAM, 0);
+                if (ufd < 0){
+                    vlog(ERROR, "New socket error\n");
+				    free_ev_container(evc);
+                    break;
+                }
+                base = bufferevent_get_base(bev);
+                ev_udp = event_new(base, ufd, EV_READ, udp_cb, (void *)evc); 
+                event_add(ev_udp, NULL);
+
+                evc->ev_udp = ev_udp;
+            }
+
+			rc = parse_header(data, datalen, &evc->domain_info);
+			if (rc != 0){
+				vlog(ERROR, "bad package!\n");
+				free_ev_container(evc);
+				break;
+			}
+
+			vlog(DEBUG, "==> (UDP) <%s:%d> connect to <%s:%d>\n", 
+				inet_ntoa(((struct sockaddr_in *)&evc->sa)->sin_addr),
+				ntohs(((struct sockaddr_in *)&evc->sa)->sin_port),
+				evc->domain_info.address,
+				evc->domain_info.port
+			);
+
+            ((struct sockaddr_in *)&evc->sa_remote)->sin_family = AF_INET;
+            ((struct sockaddr_in *)&evc->sa_remote)->sin_port = htons(evc->domain_info.port);
+
+            base = bufferevent_get_base(bev);
+            ufd = event_get_fd(evc->ev_udp); 
+
+            uwb = (struct udp_write_block *)CALLOC(1, sizeof(struct udp_write_block));
+            uwb->event = event_new(base, ufd, EV_WRITE, udp_cb, (void *)uwb);
+            uwb->buffer = (unsigned char *)CALLOC(BUFFER_MAX, sizeof(unsigned char));
+            assert(uwb->buffer);
+
+            memcpy(uwb->buffer, data + 10, datalen - 10);
+            uwb->buffer_size = datalen - 10;
+            uwb->domain_info = evc->domain_info;
+
+			if (evc->domain_info.type == type_ip){
+			    ((struct sockaddr_in *)&evc->sa_remote)->sin_addr.s_addr = inet_addr(evc->domain_info.address);
+
+                uwb->sa = evc->sa_remote; 
+                uwb->sa_len = sizeof(evc->sa_remote);
+
+                event_add(uwb->event, NULL);
+			} else if(evc->domain_info.type == type_domain) {
+				struct evutil_addrinfo hints;
+
+                uwb->sa = evc->sa_remote; 
+                uwb->sa_len = sizeof(evc->sa_remote);
+
+				memset(&hints, 0, sizeof(hints));
+				hints.ai_family = AF_UNSPEC;
+				hints.ai_flags = EVUTIL_AI_CANONNAME;
+				uwb->dns_req = evdns_getaddrinfo(evc->evdns_base, evc->domain_info.address, NULL, &hints, udp_dns_cb, (void *)uwb);
+            }
 		} else { //<stream
-			bufferevent_write(partner, outdata, datalen);
+			bufferevent_write(partner, data, datalen);
 			bufferevent_enable(partner, EV_WRITE);
 		}
 	}while(0);
 
-	free(data);
-    free(outdata);
+	FREE(data);
 }
 
 static void
@@ -350,7 +466,7 @@ listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
 	}
 
     //< ev container
-	evc = (struct ev_container *)calloc(1, sizeof(struct ev_container));
+	evc = (struct ev_container *)CALLOC(1, sizeof(struct ev_container));
 	assert(evc);
 
     evc->sa = *sa;
@@ -394,7 +510,7 @@ server_init(int argc, char **argv, void *self)
 
 	rs_obj = (struct rs_object_base *)self;
 
-	config_info = (struct config_info *)calloc(1, sizeof(struct config_info));
+	config_info = (struct config_info *)CALLOC(1, sizeof(struct config_info));
 	assert(config_info);
 
     loglevel = ERROR;
