@@ -225,9 +225,6 @@ static void udp_cb(evutil_socket_t fd, short which, void *user_data)
     struct udp_write_block *uwb;
     unsigned char *data = NULL;
     struct domain_info domain_info;
-    //object_t server_table_node;
-    //char buffer[256];
-    //uint32_t hash[4];
 
     if (which & EV_READ){
         evc = user_data;
@@ -246,7 +243,10 @@ static void udp_cb(evutil_socket_t fd, short which, void *user_data)
         evc->usa = sa;
         evc->usa_len = socklen;
 
-        vlog(INFO, "UDP RECV(%d)\n", datalen);
+        vlog(INFO, "UDP RECV(%d) FROM (%s:%d)\n", 
+            datalen, 
+            inet_ntoa(((struct sockaddr_in *)&sa)->sin_addr), 
+            ntohs(((struct sockaddr_in *)&sa)->sin_port));
         vlog_array(INFO, data, datalen);
 
         if (data[0] != 0x00 || data[1] != 0x00){
@@ -261,22 +261,6 @@ static void udp_cb(evutil_socket_t fd, short which, void *user_data)
             return;
         }
 
-        /*
-        //insert server table
-        server_table_node = (object_t)calloc(1, sizeof(struct object));
-        assert(server_table_node);
-
-        memset(buffer, 0, sizeof(buffer));
-        snprintf(buffer, 255, "%s:%d", domain_info.address, domain_info.port);
-        rs_md5((uint8_t*)buffer, strlen(buffer), hash);
-
-        snprintf(server_table_node->name, OBJ_NAME_MAX - 1, "%08x%08x%08x%08x", hash[0], hash[1], hash[2], hash[3]);
-        vlog(INFO, "%s:%d hash(%s)\n", domain_info.address, domain_info.port, server_table_node->name);
-
-        if (!object_container_find(server_table_node->name, &evc->udp_server_table))
-            object_container_addend(server_table_node, &evc->udp_server_table);
-        */
-
         //relay to server
         rs_encrypt(data, data, datalen, evc->server_info->server_pwd);
         bufferevent_write(evc->bev_remote, data, datalen);
@@ -286,6 +270,13 @@ static void udp_cb(evutil_socket_t fd, short which, void *user_data)
 
         data = uwb->buffer;
         datalen = uwb->buffer_size;
+
+        vlog(INFO, "UDP SEND(%d) TO (%s:%d)\n", 
+            datalen,
+            inet_ntoa(((struct sockaddr_in *)&uwb->sa)->sin_addr),
+            ntohs(((struct sockaddr_in *)&uwb->sa)->sin_port));
+        vlog_array(INFO, data, datalen);
+
         sendto(fd, data, datalen, 0, &uwb->sa, uwb->sa_len);
 
         event_free(uwb->event);

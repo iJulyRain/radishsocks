@@ -157,10 +157,49 @@ conn_eventcb(struct bufferevent *bev, short events, void *user_data)
 
 static void udp_cb(evutil_socket_t fd, short which, void *user_data)
 {
+    int datalen = 0;
+    struct sockaddr_in sa;
+    socklen_t socklen;
+	struct ev_container *evc;
+    struct udp_write_block *uwb;
+
+    unsigned char *data = NULL;
+
     if (which & EV_READ){
+        evc = user_data;
+        data = evc->buffer_in;
 
+        socklen = sizeof(sa);
+        memset(&sa, 0, sizeof(sa));
+        memset(data, 0, BUFFER_MAX);
+
+        datalen = recvfrom(fd, data + 10, BUFFER_MAX - 10, 0, (struct sockaddr *)&sa, &socklen);
+        if (datalen < 0){
+            vlog(ERROR, "UDP recvfrom error!\n");
+            return;
+        }
+
+        vlog(INFO, "UDP RECV(%d)\n", datalen);
+        vlog_array(INFO, data + 10, datalen);
+
+        data[0] = 0x00; data[1] = 0x00; data[2] = 0x00; data[3] = 0x01;
+        memcpy(data + 4, &sa.sin_addr.s_addr, 4);
+        memcpy(data + 8, &sa.sin_port, 2);
+
+        rs_encrypt(data, data, datalen + 10, evc->local_info->local_pwd);
+
+        bufferevent_write(evc->bev_local, data, datalen + 10);
+        bufferevent_enable(evc->bev_local, EV_WRITE);
     } else if (which & EV_WRITE) {
+        uwb = user_data;
 
+        data = uwb->buffer;
+        datalen = uwb->buffer_size;
+        sendto(fd, data, datalen, 0, &uwb->sa, uwb->sa_len);
+
+        event_free(uwb->event);
+        FREE(uwb->buffer);
+        FREE(uwb);
     }
 }
 
@@ -172,7 +211,7 @@ remote_readcb(struct bufferevent *bev, void *user_data)
 	struct ev_container *evc = user_data;
     struct bufferevent *partner = evc->bev_local;
 	ev_ssize_t datalen = 0;
-	unsigned char *data = NULL, *outdata = NULL;
+	unsigned char *data = NULL;
 
 	datalen = evbuffer_get_length(input); 
 	data = (unsigned char *)CALLOC(datalen, sizeof(unsigned char));
@@ -185,15 +224,12 @@ remote_readcb(struct bufferevent *bev, void *user_data)
     reset_timer(evc->timeout_ev, BEV_TIMEOUT);
 
     //TODO encrypt
-    outdata = (unsigned char *)CALLOC(datalen, sizeof(unsigned char));
-    rs_encrypt(data, outdata, datalen, evc->local_info->local_pwd);
-    //memcpy(outdata, data, datalen);
+    rs_encrypt(data, data, datalen, evc->local_info->local_pwd);
 
-    bufferevent_write(partner, outdata, datalen);
+    bufferevent_write(partner, data, datalen);
     bufferevent_enable(partner, EV_WRITE);
 
 	FREE(data);
-    FREE(outdata);
 }
 
 static void
@@ -368,7 +404,7 @@ local_readcb(struct bufferevent *bev, void *user_data)
                     break;
                 }
                 base = bufferevent_get_base(bev);
-                ev_udp = event_new(base, ufd, EV_READ, udp_cb, (void *)evc); 
+                ev_udp = event_new(base, ufd, EV_READ | EV_PERSIST, udp_cb, (void *)evc); 
                 event_add(ev_udp, NULL);
 
                 evc->ev_udp = ev_udp;
@@ -474,6 +510,9 @@ listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
 	evc->bev_remote = bev_out;
 	evc->local_info = &config_info->local_info;
 	evc->evdns_base = config_info->evdns_base;
+
+    evc->buffer_in = (unsigned char *)CALLOC(BUFFER_MAX, sizeof(unsigned char));
+    assert(evc->buffer_in);
 
 	///<local
 	bufferevent_setcb(bev_in, local_readcb, conn_writecb, conn_eventcb, (void *)evc);
