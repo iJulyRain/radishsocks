@@ -19,7 +19,15 @@
 #define __RS_COMMON_H__
 
 #include "base.h"
-#include <gperftools/tcmalloc.h>
+
+#ifdef TCMALLOC
+    #include <gperftools/tcmalloc.h>
+    #define CALLOC tc_calloc
+    #define FREE tc_free
+#else
+    #define CALLOC calloc
+    #define FREE free
+#endif
 
 #define ADDRESS_MAX 256 
 
@@ -30,8 +38,6 @@
 
 #define BUFFER_MAX 4096
 
-#define CALLOC tc_calloc
-#define FREE tc_free
 
 enum{
     type_ip = 0,

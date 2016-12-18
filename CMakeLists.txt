@@ -13,15 +13,11 @@ set(LIBRARY_OUTPUT_PATH ${PROJECT_BINARY_DIR}/output)
 set(CMAKE_C_FLAGS "-Wall -g ")
 
 include_directories(
-${PROJECT_SOURCE_DIR}/radishsocks/
-${PROJECT_SOURCE_DIR}/libevent/include/
-${PROJECT_SOURCE_DIR}/tcmalloc/include/
+    ${PROJECT_SOURCE_DIR}/radishsocks/
 )
 
 link_directories(
-${PROJECT_SOURCE_DIR}/radishsocks/
-${PROJECT_SOURCE_DIR}/libevent/lib/
-${PROJECT_SOURCE_DIR}/tcmalloc/lib/
+    ${PROJECT_SOURCE_DIR}/radishsocks/
 )
 
 add_subdirectory(radishsocks)
